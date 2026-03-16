@@ -1,0 +1,74 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+
+  theses Thesis[]
+
+  @@map("users")
+}
+
+model Thesis {
+  id          String        @id @default(uuid())
+  userId      String        @map("user_id")
+  assetName   String        @map("asset_name")
+  direction   Direction
+  thesisText  String        @map("thesis_text")
+  status      ThesisStatus  @default(ACTIVE)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  user        User          @relation(fields: [userId], references: [id])
+  evaluations Evaluation[]
+
+  @@map("theses")
+}
+
+model Evaluation {
+  id              String          @id @default(uuid())
+  thesisId        String          @map("thesis_id")
+  newsHeadline    String          @map("news_headline")
+  newsBody        String?         @map("news_body")
+  impactDirection ImpactDirection @map("impact_direction")
+  confidence      Int
+  reasoning       String
+  suggestedAction SuggestedAction @map("suggested_action")
+  keyRiskFactors  String[]        @map("key_risk_factors")
+  createdAt       DateTime        @default(now()) @map("created_at")
+
+  thesis Thesis @relation(fields: [thesisId], references: [id])
+
+  @@map("evaluations")
+}
+
+enum Direction {
+  LONG
+  SHORT
+}
+
+enum ThesisStatus {
+  ACTIVE
+  PAUSED
+  CLOSED
+}
+
+enum ImpactDirection {
+  SUPPORTS
+  WEAKENS
+  NEUTRAL
+}
+
+enum SuggestedAction {
+  HOLD
+  REVIEW
+  CONSIDER_CLOSING
+}
