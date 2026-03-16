@@ -216,3 +216,181 @@ The next PRs will add real functionality on top of this foundation:
 | TTA-003 | Thesis CRUD API — create, list, update, delete theses |
 | TTA-004 | LLM Evaluator — send a news headline + thesis to Claude, get back a structured impact assessment |
 | TTA-005 | Frontend UI — thesis form, news input form, evaluation result display |
+
+---
+
+## TTA-002 — Database Schema (Prisma + PostgreSQL)
+
+### What are we doing?
+
+Every thesis a user writes, and every evaluation the AI produces, needs to be stored permanently. This PR introduces the database layer: the schema that defines our tables, and the Prisma ORM that lets TypeScript code talk to PostgreSQL in a type-safe way.
+
+---
+
+### Why PostgreSQL?
+
+PostgreSQL is a production-grade relational database. We chose it over SQLite (simpler but file-based, not suited for concurrent access) and over NoSQL options (MongoDB, DynamoDB) because our data is inherently relational:
+
+- A **thesis** belongs to a **user**
+- An **evaluation** belongs to a **thesis**
+
+These relationships are natural in a relational model. PostgreSQL also has strong support for enums, arrays (we use `String[]` for `keyRiskFactors`), and will handle the time-series evaluation history we need in later MVPs.
+
+---
+
+### What is an ORM?
+
+ORM stands for Object-Relational Mapper. Without one, you would write raw SQL strings:
+
+```typescript
+const result = await client.query(
+  'INSERT INTO theses (user_id, asset_name, direction, thesis_text) VALUES ($1, $2, $3, $4) RETURNING *',
+  [userId, assetName, direction, thesisText]
+);
+```
+
+With Prisma (our ORM), the same operation is:
+
+```typescript
+const thesis = await db.thesis.create({
+  data: { userId, assetName, direction, thesisText }
+});
+```
+
+The ORM gives you:
+- **Type safety** — `db.thesis.create` knows exactly what fields are required. Pass the wrong field name and TypeScript errors at compile time, not at runtime when the query hits production.
+- **Auto-generated types** — Prisma reads your schema and generates TypeScript types for every model. You never manually define a `Thesis` interface.
+- **No SQL injection risk** — all values are parameterised automatically.
+- **Migrations** — Prisma tracks schema changes and generates SQL migration files so your database schema stays in sync with your code.
+
+---
+
+### The Schema (prisma/schema.prisma)
+
+The schema file is the single source of truth for the database structure. Prisma reads it to generate the TypeScript client and to create migration SQL.
+
+**generator block** — tells Prisma to generate a TypeScript client (`prisma-client-js`). After running `prisma generate`, you import `{ PrismaClient }` from `@prisma/client` and get fully typed access to every table.
+
+**datasource block** — tells Prisma which database to connect to. `env("DATABASE_URL")` reads the connection string from the `.env` file at runtime.
+
+---
+
+### The Models
+
+#### User
+```prisma
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+  theses    Thesis[]
+}
+```
+
+- `@id` — marks this as the primary key.
+- `@default(uuid())` — the database generates a UUID for every new row automatically. We use UUIDs instead of sequential integers because they are globally unique (safe when data is distributed or merged) and do not leak information about how many records exist.
+- `@unique` on `email` — enforces uniqueness at the database level, not just in application code. Even if two requests arrive simultaneously, only one will succeed.
+- `@map("created_at")` — the Prisma model field is `createdAt` (camelCase, TypeScript convention), but the actual database column is `created_at` (snake_case, SQL convention). `@map` bridges the two.
+- `theses Thesis[]` — this is a **relation field**. It does not create a column in the database; it tells Prisma that a User has many Theses. You can then do `db.user.findUnique({ include: { theses: true } })` to fetch a user and all their theses in one query.
+- `@@map("users")` — the Prisma model is named `User` (singular, PascalCase), but the database table is `users` (plural, lowercase). `@@map` bridges the two.
+
+#### Thesis
+```prisma
+model Thesis {
+  id         String       @id @default(uuid())
+  userId     String       @map("user_id")
+  assetName  String       @map("asset_name")
+  direction  Direction
+  thesisText String       @map("thesis_text")
+  status     ThesisStatus @default(ACTIVE)
+  createdAt  DateTime     @default(now()) @map("created_at")
+  updatedAt  DateTime     @updatedAt @map("updated_at")
+  ...
+}
+```
+
+- `direction Direction` — uses the `Direction` enum (`LONG` or `SHORT`). Stored as a string in PostgreSQL via a native enum type. Type-safe in TypeScript — you cannot pass `"long"` by accident.
+- `status ThesisStatus @default(ACTIVE)` — new theses start as `ACTIVE`. Users can pause or close them later. Having this as an enum (not a boolean `isActive`) means the state machine is extensible — adding `ARCHIVED` later is a one-line schema change.
+- `@updatedAt` — Prisma automatically sets this field to the current timestamp every time the row is updated. You never need to remember to set it manually.
+
+#### Evaluation
+```prisma
+model Evaluation {
+  impactDirection ImpactDirection
+  confidence      Int
+  reasoning       String
+  suggestedAction SuggestedAction
+  keyRiskFactors  String[]
+  ...
+}
+```
+
+This model maps exactly to the structured JSON the LLM returns. Every field in the AI's response has a typed column in the database:
+- `confidence Int` — 0 to 100.
+- `reasoning String` — 2-3 sentence explanation from the LLM.
+- `keyRiskFactors String[]` — PostgreSQL natively supports array columns. This stores the array of risk factor strings without needing a separate join table.
+- `newsBody String?` — the `?` makes this nullable. The news body is optional — a headline alone is sometimes enough for evaluation.
+
+---
+
+### The Enums
+
+```prisma
+enum Direction      { LONG SHORT }
+enum ThesisStatus   { ACTIVE PAUSED CLOSED }
+enum ImpactDirection { SUPPORTS WEAKENS NEUTRAL }
+enum SuggestedAction { HOLD REVIEW CONSIDER_CLOSING }
+```
+
+PostgreSQL creates native enum types for these. This means the database itself rejects invalid values — not just the application layer. If a bug causes the code to try inserting `"BULLISH"` into the `direction` column, PostgreSQL returns an error immediately.
+
+---
+
+### The Prisma Client Singleton (src/lib/db.ts)
+
+```typescript
+const globalForPrisma = globalThis as unknown as { prisma: PrismaClient };
+
+export const db = globalForPrisma.prisma ?? new PrismaClient();
+
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.prisma = db;
+}
+```
+
+This pattern solves a specific problem with hot-reloading in development.
+
+Every time you save a file in development, the dev server reloads the module. Without this pattern, each reload would create a new `PrismaClient` instance, opening a new database connection pool. After enough reloads, you exhaust PostgreSQL's connection limit.
+
+The fix: store the client on `globalThis` — the one object that persists across module reloads. On each reload, we check if a client already exists on `globalThis` and reuse it if so (`??` means "if the left side is null or undefined, use the right side"). In production, module reloads never happen, so we skip the global assignment entirely.
+
+---
+
+### Running the Migration
+
+With the schema defined, two commands set up the database:
+
+```bash
+# From apps/backend/
+npx prisma migrate dev --name init
+```
+
+This command:
+1. Reads `schema.prisma`
+2. Generates SQL (`CREATE TABLE users ...`, `CREATE TABLE theses ...`, etc.)
+3. Writes it to `prisma/migrations/[timestamp]_init/migration.sql`
+4. Runs the SQL against the database
+5. Runs `prisma generate` to update the TypeScript client
+
+The migration file is committed to git. This gives every developer (and every CI/CD environment) a reproducible history of every schema change ever made.
+
+```bash
+# To apply migrations in production (no schema drift, no interactive prompts):
+npx prisma migrate deploy
+```
+
+---
+
+### What comes next?
+
+The database schema is in place. TTA-003 will build the Thesis CRUD API on top of it — the Express routes that create, read, update, and delete theses using the Prisma client we set up here.
