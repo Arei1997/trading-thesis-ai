@@ -2,7 +2,7 @@ import { Resend } from 'resend';
 import { Evaluation, Thesis, User } from '@prisma/client';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
-const FROM = 'Trading Thesis AI <alerts@tradingthesisai.com>';
+const FROM = 'Trading Thesis AI <onboarding@resend.dev>';
 
 type EvaluationWithThesis = Evaluation & {
   thesis: Thesis & { user: User };
