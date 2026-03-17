@@ -16,6 +16,9 @@ export default function ThesisPage() {
   const [form, setForm] = useState({ newsHeadline: '', newsBody: '' });
   const [evaluating, setEvaluating] = useState(false);
   const [latestEvaluation, setLatestEvaluation] = useState<Evaluation | null>(null);
+  const [threshold, setThreshold] = useState(70);
+  const [savingThreshold, setSavingThreshold] = useState(false);
+  const [thresholdSaved, setThresholdSaved] = useState(false);
 
   const load = async () => {
     const [t, evals] = await Promise.all([
@@ -24,6 +27,7 @@ export default function ThesisPage() {
     ]);
     if (!t) { router.push('/'); return; }
     setThesis(t);
+    setThreshold(t.alertThreshold);
     setEvaluations(evals);
     setLoading(false);
   };
@@ -45,6 +49,17 @@ export default function ThesisPage() {
       setForm({ newsHeadline: '', newsBody: '' });
     }
     setEvaluating(false);
+  };
+
+  const handleSaveThreshold = async () => {
+    setSavingThreshold(true);
+    const updated = await api.theses.update(id, { alertThreshold: threshold }).catch(() => null);
+    if (updated) {
+      setThesis(updated);
+      setThresholdSaved(true);
+      setTimeout(() => setThresholdSaved(false), 2000);
+    }
+    setSavingThreshold(false);
   };
 
   if (loading) {
@@ -72,6 +87,32 @@ export default function ThesisPage() {
             <h2 className="text-xl font-bold">{thesis.assetName}</h2>
           </div>
           <p className="text-gray-400 text-sm leading-relaxed">{thesis.thesisText}</p>
+        </div>
+
+        <div className="bg-gray-900 rounded-xl p-6 mb-8">
+          <h3 className="font-semibold text-gray-200 mb-1">Alert threshold</h3>
+          <p className="text-xs text-gray-500 mb-4">
+            You will receive an email alert when an automated evaluation reaches this confidence level or higher.
+          </p>
+          <div className="flex items-center gap-4">
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={5}
+              value={threshold}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+              className="flex-1 accent-blue-500"
+            />
+            <span className="text-sm font-mono w-12 text-center">{threshold}%</span>
+            <button
+              onClick={handleSaveThreshold}
+              disabled={savingThreshold || threshold === thesis.alertThreshold}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-sm font-medium"
+            >
+              {thresholdSaved ? 'Saved ✓' : savingThreshold ? 'Saving...' : 'Save'}
+            </button>
+          </div>
         </div>
 
         <div className="bg-gray-900 rounded-xl p-6 mb-8">

@@ -1404,114 +1404,155 @@ TTA-010 builds the alert dispatcher — when a high-confidence evaluation is sto
 
 ---
 
-## TTA-010 — Alert Dispatcher (Email)
+## TTA-010 — Alert Dispatcher (Resend Email)
 
-### What are we doing?
+### What problem are we solving?
 
-When a high-confidence evaluation is stored, the user needs to know about it immediately — not when they next open the app. This PR adds the email alert dispatcher: after every evaluation, if the confidence score meets or exceeds the thesis's `alertThreshold`, an HTML email is sent to the user via Resend.
+The pipeline can now ingest news, process signals, and run LLM evaluations automatically. But that value is lost unless the trader actually *sees* the result. TTA-010 closes the loop: when an automated evaluation's confidence meets or exceeds the thesis's `alertThreshold`, an email is dispatched to the trader.
 
 ---
 
-### Why Resend?
+### Why email as the first alert channel?
 
-The traditional approach to sending email in Node.js is SMTP — configure a mail server, set credentials, handle TLS. This works but is painful to set up and unreliable in development.
+Email is the lowest-friction channel to implement and the highest-reach channel for most users — it requires no app install, no account linking, and no webhook setup on the user's side. Using **Resend** (a transactional email API) we get reliable delivery, structured HTML emails, and a free tier that covers the entire dev and MVP phase.
 
-Resend is an API-first email service with a TypeScript SDK. Sending an email is:
+In later MVPs we can add Slack webhooks, SMS, or push notifications. The architecture is designed so `alertService.ts` is a single point of extension — you add a new channel by adding a send call inside `sendAlert()`.
+
+---
+
+### How the threshold works
+
+`alertThreshold` is an integer field (0–100) on the `Thesis` model, defaulting to 70. When the `evaluationWorker` processes a job:
+
+1. It calls `evaluationService.evaluate()`.
+2. That function fetches the thesis (including its user record via Prisma relation join).
+3. After persisting the evaluation, it checks `if (result.confidence >= thesis.alertThreshold)`.
+4. If the condition is met, it calls `alertService.sendAlert()`.
+
+This keeps the threshold check co-located with the evaluation write — there is no separate polling job or cron that scans for pending alerts.
+
+---
+
+### alertService.ts
 
 ```typescript
-await resend.emails.send({
-  from: 'alerts@tradingthesisai.com',
-  to: 'user@example.com',
-  subject: '[WEAKENS] Crude Oil — 85% confidence',
-  html: '...',
-});
+// Sends one email per high-confidence evaluation
+const sendAlert = async (params: AlertParams) => {
+  if (!process.env.RESEND_API_KEY) return; // graceful no-op in dev without a key
+
+  await resend.emails.send({
+    from: 'Trading Thesis AI <onboarding@resend.dev>',
+    to: params.userEmail,
+    subject: `⚠️ Thesis Alert: ${params.assetName} — ${params.impactDirection}`,
+    html: buildEmailHtml(params),
+  });
+};
 ```
 
-Free tier: 100 emails/day, 3,000/month. More than enough for MVP 2 beta.
+The `from` address uses Resend's shared sandbox domain (`onboarding@resend.dev`) during development. For production, you verify your own domain in the Resend dashboard and update the `FROM` constant.
 
 ---
 
-### New File: src/services/alertService.ts
+### Why guard with `if (!process.env.RESEND_API_KEY) return`?
 
-The alert service has one responsibility: given a fully-loaded evaluation (with its thesis and user), send an email.
-
-**Guard clause:**
-```typescript
-if (!process.env.RESEND_API_KEY) {
-  console.warn('[alert] RESEND_API_KEY not set — skipping email');
-  return;
-}
-```
-
-If the key is missing (e.g. in local development without Resend set up), the alert is skipped gracefully — the evaluation is still stored, the system keeps running.
-
-**HTML email template** — the `buildHtml` function produces a clean, readable HTML email with:
-- Colour-coded impact direction header (green/red/grey)
-- Asset name, direction, confidence score
-- The news headline that triggered the evaluation
-- The LLM's reasoning
-- Key risk factors as a bullet list
-- Suggested action in a highlighted box
-
-The email is entirely self-contained — no external CSS, no images, inline styles only. This ensures it renders correctly across all email clients (Gmail, Outlook, Apple Mail).
-
----
-
-### Where the Alert Fires (evaluationService.ts)
-
-The alert is triggered inside `evaluate()`, after the evaluation row is created:
-
-```typescript
-const thesis = await db.thesis.findUnique({
-  where: { id: input.thesisId },
-  include: { user: true },
-});
-
-// ... LLM call, evaluation created ...
-
-if (result.confidence >= thesis.alertThreshold) {
-  await sendAlert({ ...evaluation, thesis });
-}
-```
-
-Two changes from before:
-1. The thesis query now `include`s `user` — we need the user's email address to send the alert.
-2. After storing the evaluation, confidence is compared against `thesis.alertThreshold` (default 70). Only evaluations that clear the threshold trigger an email.
-
-This means a thesis set to `alertThreshold: 90` will only alert on very high-confidence evaluations. A thesis set to `50` will alert more aggressively. The user controls this — TTA-013 will add the UI to configure it.
-
----
-
-### Alert Flow End-to-End
-
-```
-News arrives
-  → processSignal (dedup + relevance match)
-  → evaluationQueue.add(job)
-  → evaluationWorker picks up job
-  → evaluationService.evaluate()
-      → callLLM() → structured result
-      → db.evaluation.create()
-      → confidence >= alertThreshold?
-          YES → sendAlert() → Resend API → email delivered
-          NO  → skip
-```
-
----
-
-### Getting a Resend API Key
-
-1. Go to `https://resend.com` → sign up free
-2. Go to **API Keys** → **Create API Key**
-3. Add to `apps/backend/.env`:
-```
-RESEND_API_KEY="re_..."
-```
-
-For the `from` address to work in production, you need to verify a domain in Resend. For development/testing, Resend allows sending to your own verified email address without a custom domain.
+This pattern lets the application run fully in local development without an email key configured. The evaluation still runs and persists — only the email is skipped. This avoids breaking the entire pipeline just because email credentials are missing.
 
 ---
 
 ### What comes next?
 
-TTA-011 and TTA-012 are merged into TTA-013 — the frontend update. We'll add the live signal feed, filterable evaluation history, and the alert threshold slider to the UI, completing MVP 2.
+TTA-013 completes MVP 2 by updating the frontend: a live signal feed showing the ingested news, a filterable evaluation history across all theses, and an alert threshold slider on the thesis detail page so traders can tune their sensitivity without touching the database.
+
+
+---
+
+## TTA-013 — Frontend: Signal Feed, Evaluation History, Alert Threshold UI
+
+### What are we building?
+
+MVP 2 has a fully working backend pipeline — news in, evaluations out, emails sent. But the frontend is still MVP 1: you can only see theses and manually run evaluations. TTA-013 brings the pipeline into the UI with three additions:
+
+1. **Signal feed** — a live list of processed news signals
+2. **Evaluation history** — a filterable view across all theses
+3. **Alert threshold** — a slider on each thesis to control email sensitivity
+
+---
+
+### Navigation
+
+We added a persistent nav bar to `layout.tsx` (the Next.js root layout) with three links: **Theses**, **Signals**, **Evaluations**. Because `layout.tsx` is a server component, we can render static `<Link>` elements there without wrapping in `'use client'` — React only hydrates interactive parts (the children).
+
+This is the correct place for global chrome. Putting the nav in `page.tsx` would mean it disappears on inner pages.
+
+---
+
+### Signal Feed (`/signals`)
+
+The signals page fetches `GET /signals` on mount and auto-refreshes every 30 seconds using `setInterval` inside `useEffect`. The cleanup function (`return () => clearInterval(interval)`) ensures the interval is torn down when the user navigates away, preventing memory leaks.
+
+```typescript
+useEffect(() => {
+  load();
+  const interval = setInterval(load, 30000);
+  return () => clearInterval(interval);
+}, [load]);
+```
+
+Each signal card shows the source badge (Polygon / Finnhub / RSS), an optional ticker badge, the headline, a link to the source URL, and a relative time ("5m ago"). The relative time function avoids any date library dependency — it's four lines of arithmetic.
+
+---
+
+### Evaluation History (`/evaluations`)
+
+The evaluations page uses the new `GET /evaluations` endpoint which returns evaluations with their parent thesis embedded:
+
+```json
+{
+  "id": "...",
+  "newsHeadline": "...",
+  "impactDirection": "WEAKENS",
+  "confidence": 85,
+  "thesis": { "assetName": "Crude Oil WTI", "direction": "LONG" }
+}
+```
+
+Filters (impact direction, date range) are controlled by a form. Clicking **Apply** re-fetches with the selected query parameters. Clicking **Clear** resets state and re-fetches all.
+
+The `URLSearchParams` approach in `api.ts` ensures only non-empty filters are appended to the query string — sending `impactDirection=` (empty string) to the backend would break the Prisma enum cast.
+
+---
+
+### Alert Threshold Slider
+
+The threshold section is added between the thesis info card and the evaluate form in `theses/[id]/page.tsx`. It loads the current `alertThreshold` value from the thesis object and stores it in local state. When the user drags the slider, local state updates immediately (optimistic UI). Clicking **Save** calls `PATCH /theses/:id` with `{ alertThreshold: N }`.
+
+```typescript
+const handleSaveThreshold = async () => {
+  const updated = await api.theses.update(id, { alertThreshold: threshold }).catch(() => null);
+  if (updated) setThesis(updated); // sync server truth back into state
+};
+```
+
+The Save button is disabled when the local value matches the server value (no change to persist) or while the request is in flight. A brief "Saved ✓" confirmation replaces the label for 2 seconds after success — no toast library needed.
+
+---
+
+### Backend change: exposing alertThreshold in PATCH
+
+The existing `updateSchema` in `routes/theses.ts` did not include `alertThreshold`. We added it as an optional integer validated 0–100:
+
+```typescript
+alertThreshold: z.number().int().min(0).max(100).optional(),
+```
+
+The corresponding `UpdateThesisInput` interface in `thesisService.ts` was extended to match. Because Prisma's `update()` accepts a `data` object typed against the schema, no further changes were needed — Prisma handles the DB write.
+
+---
+
+### What comes next?
+
+MVP 2 is complete. MVP 3 introduces:
+- **Thesis health scores** — a rolling signal of how well the thesis is holding up over time
+- **Multi-channel alerts** — Slack webhooks and SMS alongside email
+- **Auth** — Clerk replaces the hardcoded demo user ID
+

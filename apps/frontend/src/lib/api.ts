@@ -14,6 +14,7 @@ export interface Thesis {
   direction: Direction;
   thesisText: string;
   status: ThesisStatus;
+  alertThreshold: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -28,6 +29,21 @@ export interface Evaluation {
   reasoning: string;
   suggestedAction: SuggestedAction;
   keyRiskFactors: string[];
+  createdAt: string;
+}
+
+export interface EvaluationWithThesis extends Evaluation {
+  thesis: { assetName: string; direction: Direction };
+}
+
+export interface Signal {
+  id: string;
+  hash: string;
+  source: string;
+  ticker: string | null;
+  headline: string;
+  url: string | null;
+  publishedAt: string;
   createdAt: string;
 }
 
@@ -49,7 +65,7 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ ...data, userId: DEMO_USER_ID }),
       }),
-    update: (id: string, data: Partial<Pick<Thesis, 'assetName' | 'direction' | 'thesisText' | 'status'>>) =>
+    update: (id: string, data: Partial<Pick<Thesis, 'assetName' | 'direction' | 'thesisText' | 'status' | 'alertThreshold'>>) =>
       request<Thesis>(`/theses/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
     delete: (id: string) => request<Thesis>(`/theses/${id}`, { method: 'DELETE' }),
   },
@@ -57,5 +73,18 @@ export const api = {
     listByThesis: (thesisId: string) => request<Evaluation[]>(`/evaluate/${thesisId}`),
     create: (data: { thesisId: string; newsHeadline: string; newsBody?: string }) =>
       request<Evaluation>('/evaluate', { method: 'POST', body: JSON.stringify(data) }),
+    list: (params?: { thesisId?: string; impactDirection?: ImpactDirection; from?: string; to?: string; limit?: number }) => {
+      const qs = new URLSearchParams();
+      if (params?.thesisId) qs.set('thesisId', params.thesisId);
+      if (params?.impactDirection) qs.set('impactDirection', params.impactDirection);
+      if (params?.from) qs.set('from', params.from);
+      if (params?.to) qs.set('to', params.to);
+      if (params?.limit != null) qs.set('limit', String(params.limit));
+      const query = qs.toString();
+      return request<EvaluationWithThesis[]>(`/evaluations${query ? `?${query}` : ''}`);
+    },
+  },
+  signals: {
+    list: () => request<Signal[]>('/signals'),
   },
 };

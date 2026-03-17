@@ -13,6 +13,7 @@ interface UpdateThesisInput {
   direction?: Direction;
   thesisText?: string;
   status?: ThesisStatus;
+  alertThreshold?: number;
 }
 
 const create = (data: CreateThesisInput) => {
