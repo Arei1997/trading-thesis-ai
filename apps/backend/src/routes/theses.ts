@@ -17,6 +17,7 @@ const updateSchema = z.object({
   direction: z.nativeEnum(Direction).optional(),
   thesisText: z.string().min(10).optional(),
   status: z.nativeEnum(ThesisStatus).optional(),
+  alertThreshold: z.number().int().min(0).max(100).optional(),
 });
 
 thesesRouter.post('/', async (req: Request, res: Response) => {
