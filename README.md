@@ -123,6 +123,22 @@ Open `http://localhost:3000`.
 
 ---
 
+## External APIs
+
+| API | Purpose | Auth | Free Tier |
+|-----|---------|------|-----------|
+| [Anthropic Claude](https://www.anthropic.com/api) | LLM evaluations — structured JSON output via tool use | `ANTHROPIC_API_KEY` | Pay-per-token |
+| [Polygon.io](https://polygon.io/docs/stocks/get_v2_reference_news) | Financial news REST feed, polled every 60s | `POLYGON_API_KEY` | Free tier (delayed data) |
+| [Finnhub](https://finnhub.io/docs/api/websocket-news) | Real-time news WebSocket stream | `FINNHUB_API_KEY` | Free tier (60 req/min) |
+| [Resend](https://resend.com/docs/api-reference/emails/send-email) | Transactional email alerts | `RESEND_API_KEY` | 3,000 emails/month free |
+| [Upstash Redis](https://upstash.com) | BullMQ job queue + SHA-256 dedup cache | `REDIS_URL` | 10,000 req/day free |
+| Reuters RSS | News feed, polled every 5min | None | Public |
+| MarketWatch RSS | News feed, polled every 5min | None | Public |
+| CNBC RSS | News feed, polled every 5min | None | Public |
+| Yahoo Finance RSS | News feed, polled every 5min | None | Public |
+
+---
+
 ## How the pipeline works
 
 ```
