@@ -2,17 +2,20 @@
 
 An AI-powered assistant that monitors your trading positions and alerts you when news events support or threaten your thesis.
 
-You write down why you are in a trade. The system watches financial news and tells you when something relevant happens — with a structured assessment, confidence score, and suggested action.
+You write down why you are in a trade. The system watches financial news 24/7 — from multiple live sources — and tells you when something relevant happens, with a structured AI assessment, confidence score, and suggested action.
 
 ---
 
 ## What it does
 
 - Store a thesis per position (e.g. *"Long oil — Middle East supply shock thesis"*)
-- Paste a news headline and body to evaluate it against any thesis
-- Receive a structured AI assessment: **SUPPORTS / WEAKENS / NEUTRAL**
-- See confidence score, reasoning, suggested action, and key risk factors
-- Full evaluation history per thesis
+- Automatically ingests live news from **Polygon.io**, **Finnhub WebSocket**, and **RSS feeds**
+- Deduplicates signals across sources and matches them to relevant theses
+- Runs LLM evaluations automatically in the background via a job queue
+- Sends email alerts when a high-confidence evaluation is produced
+- Manually evaluate any news headline against a thesis at any time
+- Browse the live signal feed and filter evaluation history across all theses
+- Set a per-thesis alert threshold — only get emailed when confidence meets your bar
 
 ---
 
@@ -24,6 +27,8 @@ You write down why you are in a trade. The system watches financial news and tel
 | Database | PostgreSQL + Prisma ORM |
 | LLM | Anthropic Claude API (structured output via tool use) |
 | Frontend | Next.js 14 + React + Tailwind CSS |
+| Queue | BullMQ + Redis (Upstash) |
+| Email | Resend |
 | Monorepo | pnpm workspaces + Turborepo |
 
 ---
@@ -36,13 +41,15 @@ TradingThesisAI/
 │   ├── backend/
 │   │   ├── prisma/             ← schema + migrations + seed
 │   │   └── src/
-│   │       ├── lib/            ← Prisma client
+│   │       ├── ingestion/      ← Polygon poller, Finnhub WS, RSS poller, signal processor
+│   │       ├── lib/            ← Prisma client, Redis, BullMQ queue
 │   │       ├── prompts/        ← versioned LLM prompts
 │   │       ├── routes/         ← Express route handlers
-│   │       └── services/       ← business logic
+│   │       ├── services/       ← business logic
+│   │       └── workers/        ← BullMQ evaluation worker
 │   └── frontend/
 │       └── src/
-│           ├── app/            ← Next.js pages
+│           ├── app/            ← Next.js pages (theses, signals, evaluations)
 │           ├── components/     ← UI components
 │           └── lib/            ← API client
 ├── packages/
@@ -60,6 +67,7 @@ TradingThesisAI/
 - Node.js 20+
 - pnpm (`npm install -g pnpm`)
 - PostgreSQL 15+ running locally
+- Redis instance — [Upstash](https://upstash.com) free tier works, or run locally
 
 ### 1. Clone and install
 
@@ -80,6 +88,10 @@ Edit `apps/backend/.env`:
 ```
 DATABASE_URL="postgresql://postgres:yourpassword@localhost:5432/trading_thesis_ai"
 ANTHROPIC_API_KEY="sk-ant-..."
+REDIS_URL="rediss://default:password@your-upstash-url.upstash.io:6379"
+POLYGON_API_KEY="your-polygon-api-key"
+FINNHUB_API_KEY="your-finnhub-api-key"
+RESEND_API_KEY="re_..."          # optional — alerts are skipped if absent
 PORT=3001
 NODE_ENV=development
 NEXT_PUBLIC_API_URL="http://localhost:3001"
@@ -111,18 +123,38 @@ Open `http://localhost:3000`.
 
 ---
 
+## How the pipeline works
+
+```
+Polygon.io (REST, 60s)  ─┐
+Finnhub (WebSocket)      ├─► Signal Processor ─► BullMQ Queue ─► LLM Evaluator ─► Email Alert
+RSS Feeds (5min)         ─┘        │
+                                   └─► Signals table (deduplicated)
+```
+
+1. Three ingestion sources normalise news into a common `NormalisedSignal` shape
+2. The signal processor SHA-256 deduplicates via Redis and matches signals to active theses
+3. Matched signals are dispatched to BullMQ (concurrency 3, retries 3×)
+4. The evaluation worker calls the Anthropic API with a structured tool-use prompt
+5. If `confidence >= thesis.alertThreshold`, an email is sent via Resend
+
+---
+
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
+| `GET` | `/health/pipeline` | Pipeline component status |
 | `POST` | `/theses` | Create a thesis |
 | `GET` | `/theses` | List all theses |
 | `GET` | `/theses/:id` | Get a thesis |
-| `PATCH` | `/theses/:id` | Update a thesis |
+| `PATCH` | `/theses/:id` | Update a thesis (including `alertThreshold`) |
 | `DELETE` | `/theses/:id` | Soft delete a thesis |
-| `POST` | `/evaluate` | Run an LLM evaluation |
+| `POST` | `/evaluate` | Run a manual LLM evaluation |
 | `GET` | `/evaluate/:thesisId` | List evaluations for a thesis |
+| `GET` | `/evaluations` | List all evaluations (filterable) |
+| `GET` | `/signals` | List recent signals |
 
 ---
 
@@ -149,8 +181,8 @@ Open `http://localhost:3000`.
 | MVP | Status | Scope |
 |-----|--------|-------|
 | MVP 1 | Complete | Thesis CRUD + manual LLM evaluation |
-| MVP 2 | Planned | Live news ingestion — Polygon.io, Finnhub, RSS feeds |
-| MVP 3 | Planned | Dashboard, thesis health scores, multi-channel alerts, auth |
+| MVP 2 | Complete | Live news ingestion, signal pipeline, email alerts, signal feed UI |
+| MVP 3 | Planned | Thesis health scores, multi-channel alerts, auth (Clerk) |
 | MVP 4 | Planned | Broker integration, price correlation, AI thesis suggestions |
 
 ---
