@@ -394,3 +394,176 @@ npx prisma migrate deploy
 ### What comes next?
 
 The database schema is in place. TTA-003 will build the Thesis CRUD API on top of it — the Express routes that create, read, update, and delete theses using the Prisma client we set up here.
+
+---
+
+## TTA-003 — Thesis CRUD API
+
+### What are we doing?
+
+With the database schema in place, this PR builds the HTTP API that lets clients create, read, update, and delete trading theses. It also introduces two new structural concepts: the **service layer** and **request validation**.
+
+---
+
+### New Files
+
+```
+apps/backend/src/
+├── routes/
+│   └── theses.ts        ← HTTP layer: parse request, call service, return response
+└── services/
+    └── thesisService.ts ← Business logic layer: all database operations
+```
+
+This two-layer split is a deliberate architectural choice. Here is why it matters.
+
+---
+
+### Why Separate Routes from Services?
+
+A route handler has one job: speak HTTP. It reads from `req`, calls something that does the real work, and writes to `res`.
+
+A service has one job: own the business logic. It knows nothing about HTTP — no `req`, no `res`, no status codes.
+
+Without this separation, a route handler looks like this:
+
+```typescript
+app.post('/theses', async (req, res) => {
+  const { assetName, direction, thesisText, userId } = req.body;
+  if (!assetName || !direction || !thesisText) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+  const thesis = await db.thesis.create({ data: { assetName, direction, thesisText, userId } });
+  res.status(201).json(thesis);
+});
+```
+
+This works, but the database query is now coupled to the HTTP handler. If you later want to create a thesis from a background job (e.g. auto-creating a stub thesis when a broker position is detected in MVP 4), you cannot reuse this logic — it is buried inside an Express handler.
+
+With the separation, the service becomes reusable:
+
+```typescript
+// From a route handler:
+const thesis = await thesisService.create(parsed.data);
+
+// From a background job in MVP 4:
+const thesis = await thesisService.create({ userId, assetName, direction, thesisText });
+```
+
+Same logic, called from anywhere.
+
+---
+
+### What is Zod?
+
+Zod is a TypeScript-first validation library. It lets you define the exact shape you expect from an incoming request body, and it rejects anything that does not match.
+
+Without validation, a client could POST:
+```json
+{ "assetName": "", "direction": "SIDEWAYS", "thesisText": 12345 }
+```
+And your code would try to insert garbage into the database.
+
+With Zod:
+```typescript
+const createSchema = z.object({
+  assetName: z.string().min(1),
+  direction: z.nativeEnum(Direction),
+  thesisText: z.string().min(10),
+  userId: z.string().uuid(),
+});
+
+const parsed = createSchema.safeParse(req.body);
+if (!parsed.success) {
+  res.status(400).json({ error: parsed.error.flatten() });
+  return;
+}
+```
+
+`safeParse` never throws — it returns either `{ success: true, data: ... }` or `{ success: false, error: ... }`. The `data` object on success is fully typed — TypeScript knows every field and its exact type. You pass it straight to the service with confidence.
+
+`z.nativeEnum(Direction)` — Zod reads the Prisma-generated `Direction` enum and rejects any value that is not `"LONG"` or `"SHORT"`. The valid values stay in sync with the database schema automatically — no duplication.
+
+---
+
+### The Routes (src/routes/theses.ts)
+
+| Method | Path | What it does |
+|--------|------|-------------|
+| `POST` | `/theses` | Create a new thesis |
+| `GET` | `/theses` | List all theses, newest first |
+| `GET` | `/theses/:id` | Fetch a single thesis by ID |
+| `PATCH` | `/theses/:id` | Update any combination of fields |
+| `DELETE` | `/theses/:id` | Soft delete — sets status to `CLOSED` |
+
+Every route follows the same pattern:
+1. Validate the request body with Zod (`safeParse`)
+2. Return `400` immediately if validation fails
+3. Call the relevant service method
+4. Return `404` if the record was not found
+5. Return the result as JSON
+
+The route file never touches `db` directly — all database access goes through the service.
+
+---
+
+### The Service (src/services/thesisService.ts)
+
+**Soft delete:**
+```typescript
+const softDelete = (id: string) => {
+  return db.thesis
+    .update({ where: { id }, data: { status: ThesisStatus.CLOSED } })
+    .catch(() => null);
+};
+```
+
+Soft delete means we never remove the row — we set `status` to `CLOSED`. This is intentional. A deleted thesis still has evaluations attached to it. Hard-deleting the thesis row would either cascade-delete all evaluations (losing history) or leave orphaned evaluation rows (breaking referential integrity). Soft delete preserves everything and keeps the audit trail intact.
+
+`.catch(() => null)` — Prisma throws when `update` finds no matching row. Rather than letting that propagate as an unhandled 500 error, we catch it and return `null`. The route layer checks for `null` and returns a clean `404`. This keeps error handling explicit and predictable at every layer.
+
+---
+
+### Mounting Routes in index.ts
+
+```typescript
+import { thesesRouter } from './routes/theses';
+app.use('/theses', thesesRouter);
+```
+
+`app.use('/theses', thesesRouter)` mounts the entire router at the `/theses` prefix. Every route defined inside `thesesRouter` is relative to that prefix — `router.get('/:id')` becomes `GET /theses/:id`. This keeps `index.ts` clean as more route files are added in future PRs — you just add one more `app.use(...)` line.
+
+---
+
+### Testing the API
+
+Once running (`pnpm dev`), you can test with curl or Postman:
+
+```bash
+# Create a thesis
+curl -X POST http://localhost:3001/theses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "a0000000-0000-0000-0000-000000000001",
+    "assetName": "Crude Oil (WTI)",
+    "direction": "LONG",
+    "thesisText": "Long oil due to expected supply disruptions from ongoing Middle East tensions reducing OPEC output capacity."
+  }'
+
+# List all theses
+curl http://localhost:3001/theses
+
+# Update status
+curl -X PATCH http://localhost:3001/theses/<id> \
+  -H "Content-Type: application/json" \
+  -d '{ "status": "PAUSED" }'
+
+# Soft delete
+curl -X DELETE http://localhost:3001/theses/<id>
+```
+
+---
+
+### What comes next?
+
+TTA-004 adds the `POST /evaluate` endpoint — the core of the product. It accepts a thesis ID and a news headline, sends both to the Claude API with a versioned structured prompt, and returns a typed impact assessment (`SUPPORTS` / `WEAKENS` / `NEUTRAL`) with a confidence score, reasoning, suggested action, and key risk factors.
