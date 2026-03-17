@@ -1159,3 +1159,130 @@ With TTA-007 merged, the system runs without any manual input:
 ### What comes next?
 
 TTA-008 adds Finnhub WebSocket (real-time, sub-second news delivery) and RSS feed ingestion (FT, Reuters, Bloomberg for macro news). Both feed into the same `processSignal` function — the normalisation layer means zero changes needed to the processor or worker.
+
+---
+
+## TTA-008 — Finnhub WebSocket + RSS Ingestion
+
+### What are we doing?
+
+TTA-007 gave us one news source (Polygon.io) polling every 60 seconds. This PR adds two more: Finnhub via a persistent WebSocket connection for real-time sub-second delivery, and RSS feeds from Reuters, the Financial Times, and Investing.com for broad macro coverage. All three sources feed into the same `processSignal` function — the normalisation layer from TTA-007 means zero changes to the processor or worker.
+
+---
+
+### New Files
+
+```
+apps/backend/src/ingestion/
+├── finnhubSocket.ts   ← persistent WebSocket, auto-reconnect
+└── rssPoller.ts       ← polls 3 RSS feeds every 5 minutes
+```
+
+---
+
+### Finnhub WebSocket (src/ingestion/finnhubSocket.ts)
+
+Finnhub offers a WebSocket API that pushes news in real time — as soon as an article is published, it arrives at our connection. This is fundamentally different from polling:
+
+| | Polling (Polygon) | WebSocket (Finnhub) |
+|--|---|---|
+| Latency | Up to 60 seconds | Sub-second |
+| Connection | New HTTP request every minute | Single persistent TCP connection |
+| Server load | Regular API calls | One connection, event-driven |
+
+For a trading system where minutes matter, WebSocket delivery is worth the added complexity.
+
+**Connection lifecycle:**
+
+```typescript
+ws.on('open', () => {
+  ws.send(JSON.stringify({ type: 'subscribe', symbol: 'GENERAL:^NEWS' }));
+});
+```
+
+On connection, we subscribe to `GENERAL:^NEWS` — Finnhub's general news stream. Finnhub then pushes all news events to this connection as they are published.
+
+**Auto-reconnect:**
+
+```typescript
+ws.on('close', () => {
+  setTimeout(connect, RECONNECT_DELAY_MS);
+});
+```
+
+WebSocket connections drop — network hiccups, server restarts, idle timeouts. The `close` handler schedules a reconnection attempt after 5 seconds. This makes the ingestion self-healing: if the connection drops at 3am, it reconnects automatically without any human intervention.
+
+**Message handling:**
+
+```typescript
+const msg: FinnhubNewsItem = JSON.parse(raw.toString());
+if (msg.type !== 'news' || !msg.data?.length) return;
+```
+
+Finnhub sends different message types over the same connection (news, ping, error). We filter for `type === 'news'` and ignore everything else. Each news message can contain multiple articles in `data[]` — we process each one through `processSignal`.
+
+---
+
+### RSS Ingestion (src/ingestion/rssPoller.ts)
+
+RSS (Really Simple Syndication) is a standardised XML feed format that almost every major publisher supports. It is free, requires no API key, and covers macro and geopolitical news that financial APIs often miss.
+
+**Why RSS for macro news?**
+
+Polygon and Finnhub focus on equity markets — tickers, earnings, corporate actions. Our system also needs to catch macro events: central bank decisions, geopolitical developments, commodity supply news. Reuters and the FT publish these through RSS feeds that are publicly accessible.
+
+**Feed list:**
+
+```typescript
+const FEEDS = [
+  { url: 'https://feeds.reuters.com/reuters/businessNews', source: 'Reuters' },
+  { url: 'https://feeds.ft.com/rss/home/uk',              source: 'Financial Times' },
+  { url: 'https://www.investing.com/rss/news.rss',        source: 'Investing.com' },
+];
+```
+
+**`rss-parser`** handles the XML parsing. It fetches the URL, parses the XML, and returns a clean JavaScript object with `items[]`. We map each item to a `NormalisedSignal`.
+
+RSS articles have no `tickers[]` — relevance matching falls back entirely to text matching (headline + body containing the thesis asset name). This is why `NormalisedSignal.tickers` is typed as `string[]` with an empty array as the RSS default.
+
+**5-minute poll interval:**
+
+```typescript
+const POLL_INTERVAL_MS = 300_000;
+```
+
+RSS feeds are not real-time — publishers typically update them every few minutes. Polling every 5 minutes is sufficient and avoids hammering the feed servers. The deduplication layer in `signalProcessor` ensures articles seen on one poll are not reprocessed on the next.
+
+**Per-feed error isolation:**
+
+```typescript
+for (const feed of FEEDS) {
+  try {
+    await pollFeed(feed.url, feed.source);
+  } catch (err) {
+    console.error(`[rss] error polling ${feed.source}:`, message);
+  }
+}
+```
+
+Each feed is polled inside its own try/catch. If the Reuters feed is down, the FT and Investing.com feeds still run. One failed source does not block the others.
+
+---
+
+### Three Sources, One Pipeline
+
+With TTA-008 merged, three independent ingestion paths all converge on `processSignal`:
+
+```
+Polygon.io (60s poll)  ──┐
+Finnhub WebSocket      ──┼──▶ processSignal ──▶ dedup ──▶ relevance match ──▶ queue ──▶ worker ──▶ LLM
+RSS feeds (5m poll)    ──┘
+```
+
+The same deduplication hash prevents the same story from being processed twice, even if Polygon and Reuters both publish it. The normalisation layer means adding a fourth source in future is a single new file — no changes anywhere else.
+
+---
+
+### What comes next?
+
+TTA-009 adds the `/signals` and `/evaluations` API endpoints so the frontend can display the live signal feed and filterable evaluation history. TTA-010 follows with the alert dispatcher — email notifications when a high-confidence evaluation arrives.

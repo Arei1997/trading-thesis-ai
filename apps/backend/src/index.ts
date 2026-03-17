@@ -6,6 +6,8 @@ import { evaluateRouter } from './routes/evaluate';
 import { evaluationQueue } from './lib/queue';
 import './workers/evaluationWorker';
 import { startPolygonPoller } from './ingestion/polygonPoller';
+import { startFinnhubSocket } from './ingestion/finnhubSocket';
+import { startRssPoller } from './ingestion/rssPoller';
 
 dotenv.config();
 
@@ -34,6 +36,8 @@ app.use('/evaluate', evaluateRouter);
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
   startPolygonPoller();
+  startFinnhubSocket();
+  startRssPoller();
 });
 
 export default app;
