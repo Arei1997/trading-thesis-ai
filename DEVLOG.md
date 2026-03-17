@@ -1012,3 +1012,150 @@ This endpoint gives a real-time snapshot of the queue state. Useful for debuggin
 ### What comes next?
 
 The queue infrastructure is in place. TTA-007 connects to the Polygon.io News API, polls it every 60 seconds, and pushes relevant jobs onto the evaluation queue automatically.
+
+---
+
+## TTA-007 — Polygon.io News Poller + Signal Processor
+
+### What are we doing?
+
+This PR connects the system to a real financial news source for the first time. Every 60 seconds, the Polygon.io News API is polled for recent articles. Each article is normalised into a standard shape, deduplicated, matched against active theses, and — if relevant — pushed onto the BullMQ evaluation queue. The worker from TTA-006 then picks up the job and calls the LLM automatically.
+
+---
+
+### New Files
+
+```
+apps/backend/src/ingestion/
+├── types.ts           ← NormalisedSignal — the standard shape all sources output
+├── polygonPoller.ts   ← polls Polygon.io every 60s, normalises articles
+└── signalProcessor.ts ← deduplication, relevance matching, queue dispatch
+```
+
+---
+
+### Why a Normalisation Layer?
+
+MVP 2 ingests from multiple sources: Polygon.io, Finnhub, RSS feeds. Each returns data in a completely different shape:
+
+- Polygon returns `{ title, description, published_utc, tickers[] }`
+- Finnhub returns `{ headline, summary, datetime, related }`
+- RSS returns `{ title, content, pubDate, categories[] }`
+
+Without normalisation, every piece of downstream code (deduplication, relevance matching, queue dispatch) would need to know about each source's shape. Adding a new source would mean updating all of them.
+
+The `NormalisedSignal` interface defines a single shape that all sources map to:
+
+```typescript
+interface NormalisedSignal {
+  headline: string;
+  body: string;
+  publishedAt: string;
+  source: string;
+  tickers: string[];
+  url: string;
+}
+```
+
+Each ingestion source is responsible for mapping its own response to this shape. Everything downstream speaks only `NormalisedSignal` — it doesn't know or care where the article came from.
+
+---
+
+### The Polygon Poller (src/ingestion/polygonPoller.ts)
+
+```typescript
+export const startPolygonPoller = () => {
+  poll();
+  setInterval(poll, POLL_INTERVAL_MS);
+};
+```
+
+`setInterval` runs `poll()` every 60 seconds indefinitely. The first call is immediate — no waiting for the first interval to elapse before data starts flowing.
+
+**Incremental fetching with `lastPublishedAt`** — on the first poll, all recent articles are fetched. On every subsequent poll, we send `published_utc.gt=<lastPublishedAt>` to Polygon, which returns only articles published after the last one we saw. This prevents re-processing the same articles on every poll.
+
+```typescript
+if (lastPublishedAt) {
+  params['published_utc.gt'] = lastPublishedAt;
+}
+```
+
+After a successful fetch, `lastPublishedAt` is updated to the most recent article's timestamp. On server restart, this resets to `null` and we fetch recent articles again — a small amount of reprocessing, harmless because of deduplication.
+
+**Graceful error handling** — if the Polygon API is down or returns an error, the `catch` block logs the error and returns. The `setInterval` keeps running — the next poll will try again. The server does not crash.
+
+---
+
+### The Signal Processor (src/ingestion/signalProcessor.ts)
+
+The processor does three things in sequence for every incoming signal.
+
+**1. Deduplication**
+
+```typescript
+const hash = createHash('sha256')
+  .update(`${signal.source}:${signal.headline}`)
+  .digest('hex');
+
+const key = `dedup:${hash}`;
+const existing = await redis.get(key);
+if (existing) return true;
+await redis.setex(key, DEDUP_TTL_SECONDS, '1');
+```
+
+A SHA-256 hash of `source + headline` is computed and stored in Redis with a 1-hour TTL (`setex` = set + expire). If the same key already exists, the article has already been processed — return early.
+
+Why SHA-256? It produces a fixed-length 64-character hex string regardless of input length. Storing the full headline as a Redis key would be wasteful and inconsistent. The hash is deterministic — the same headline always produces the same hash.
+
+Why 1 hour TTL? Long enough to catch duplicates from multiple sources covering the same story. Short enough that the Redis memory footprint stays small.
+
+**2. Relevance Matching**
+
+```typescript
+const theses = await db.thesis.findMany({ where: { status: 'ACTIVE' } });
+
+return theses.filter((thesis) => {
+  const tickerMatch = signal.tickers.some(t => assetLower.includes(t.toLowerCase()));
+  const textMatch = headlineLower.includes(assetLower) || bodyLower.includes(assetLower);
+  return tickerMatch || textMatch;
+});
+```
+
+Only `ACTIVE` theses are fetched — no point evaluating news against paused or closed positions.
+
+Two matching strategies:
+- **Ticker match** — Polygon tags articles with stock tickers (e.g. `["AAPL", "MSFT"]`). If any ticker appears in the thesis asset name (or vice versa), it's a match.
+- **Text match** — if the thesis asset name appears anywhere in the headline or body, it's a match. This catches commodities and macro assets that don't have tickers (`"Crude Oil"`, `"Gold"`, `"US Dollar"`).
+
+This relevance filter is the most important cost-saving mechanism in the system. Without it, every news article would trigger LLM calls for every thesis. With it, only genuinely relevant articles make it to the queue.
+
+**3. Queue Dispatch**
+
+```typescript
+await evaluationQueue.add(
+  `eval:${thesis.id}:${signal.publishedAt}`,
+  { thesisId: thesis.id, newsHeadline: signal.headline, newsBody: signal.body, source: signal.source },
+);
+```
+
+One job is pushed per `(thesis, signal)` pair. The job name `eval:[thesisId]:[publishedAt]` is human-readable in the BullMQ dashboard and unique enough to identify each job.
+
+The evaluation worker from TTA-006 picks these jobs up automatically — no changes needed there.
+
+---
+
+### The Full Automated Flow
+
+With TTA-007 merged, the system runs without any manual input:
+
+1. Server starts → `startPolygonPoller()` begins polling every 60 seconds
+2. Article arrives → `processSignal()` deduplicates and matches against active theses
+3. Relevant matches → jobs pushed to `evaluation` queue
+4. Worker picks up job → calls `evaluationService.evaluate()` → LLM returns structured assessment
+5. Evaluation stored in PostgreSQL → visible in thesis history on the frontend
+
+---
+
+### What comes next?
+
+TTA-008 adds Finnhub WebSocket (real-time, sub-second news delivery) and RSS feed ingestion (FT, Reuters, Bloomberg for macro news). Both feed into the same `processSignal` function — the normalisation layer means zero changes needed to the processor or worker.

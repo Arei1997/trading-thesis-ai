@@ -5,6 +5,7 @@ import { thesesRouter } from './routes/theses';
 import { evaluateRouter } from './routes/evaluate';
 import { evaluationQueue } from './lib/queue';
 import './workers/evaluationWorker';
+import { startPolygonPoller } from './ingestion/polygonPoller';
 
 dotenv.config();
 
@@ -32,6 +33,7 @@ app.use('/evaluate', evaluateRouter);
 
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
+  startPolygonPoller();
 });
 
 export default app;
