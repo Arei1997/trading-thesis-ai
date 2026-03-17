@@ -864,3 +864,151 @@ With TTA-005 merged, the full MVP 1 loop is working end-to-end:
 7. All past evaluations are shown in the history list below
 
 **Next: MVP 2** — connect to real financial news APIs (Polygon.io, Finnhub), build a Redis-backed ingestion pipeline, and automate the evaluation loop so it runs continuously without manual input.
+
+---
+
+## TTA-006 — Redis + BullMQ Queue Infrastructure
+
+### What are we doing?
+
+MVP 1 required manual news input — a user had to paste a headline to trigger an evaluation. MVP 2 makes the system fully automated: news articles come in continuously from external APIs, and the system evaluates them against all active theses without any human input.
+
+This PR lays the infrastructure that makes that possible: a Redis connection and a BullMQ job queue. No news ingestion yet — that comes in TTA-007 and TTA-008. This PR just builds the pipes.
+
+---
+
+### Why a Queue?
+
+Without a queue, the automated flow would look like this:
+
+1. News article arrives
+2. Fetch all active theses (say 50 users × 5 theses = 250 theses)
+3. Call the LLM 250 times simultaneously
+
+This causes two problems:
+- **Rate limiting** — the Anthropic API has request limits. 250 simultaneous calls would hit them instantly and start failing.
+- **Thundering herd** — a single news event causes a massive spike in compute. The system becomes unpredictable under load.
+
+With a queue, the flow becomes:
+1. News article arrives
+2. Check relevance — only push jobs for theses where the article's entities match the thesis asset
+3. Jobs sit in the queue
+4. Worker processes them at a controlled rate (concurrency: 3 at a time)
+
+The queue acts as a buffer and a rate limiter in one.
+
+---
+
+### New Files
+
+```
+apps/backend/src/
+├── lib/
+│   ├── redis.ts        ← IORedis client singleton
+│   └── queue.ts        ← BullMQ queue definition + job type
+└── workers/
+    └── evaluationWorker.ts ← processes evaluation jobs from the queue
+```
+
+---
+
+### IORedis (src/lib/redis.ts)
+
+IORedis is the Node.js Redis client. BullMQ uses it internally to communicate with Redis.
+
+```typescript
+export const redis = new IORedis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+});
+```
+
+`maxRetriesPerRequest: null` — BullMQ requires this setting. Without it, IORedis gives up after a fixed number of retries if Redis is temporarily unreachable. Setting it to `null` tells IORedis to keep retrying indefinitely, which is what you want for a long-running worker process.
+
+We use Upstash Redis (cloud-hosted) with a `rediss://` URL — the double `s` means TLS-encrypted connection over HTTPS port 6379. This bypasses the port 5432 firewall issues that affected Supabase.
+
+---
+
+### The Queue (src/lib/queue.ts)
+
+```typescript
+export const evaluationQueue = new Queue<EvaluationJobData>('evaluation', {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 2000 },
+    removeOnComplete: 100,
+    removeOnFail: 200,
+  },
+});
+```
+
+**`EvaluationJobData`** — the typed payload for every job:
+```typescript
+interface EvaluationJobData {
+  thesisId: string;
+  newsHeadline: string;
+  newsBody?: string;
+  source: string;
+}
+```
+
+Every job carries exactly what the evaluation service needs — no extra lookups required inside the worker.
+
+**`attempts: 3`** — if a job fails (e.g. Anthropic API timeout), BullMQ automatically retries it up to 3 times before marking it as failed.
+
+**`backoff: exponential`** — retries wait 2s, then 4s, then 8s before each attempt. This prevents hammering the API when it is temporarily struggling.
+
+**`removeOnComplete: 100`** — keep only the last 100 completed jobs in Redis. Completed jobs are not needed long-term — the result is already in PostgreSQL. Keeping them all would bloat Redis memory over time.
+
+**`removeOnFail: 200`** — keep the last 200 failed jobs for debugging. More than completed jobs because failures are worth investigating.
+
+---
+
+### The Worker (src/workers/evaluationWorker.ts)
+
+```typescript
+export const evaluationWorker = new Worker<EvaluationJobData>(
+  'evaluation',
+  async (job) => {
+    const result = await evaluationService.evaluate({ ... });
+    return result;
+  },
+  { connection: redis, concurrency: 3 },
+);
+```
+
+The worker listens on the `'evaluation'` queue and processes jobs as they arrive. The processor function is identical to what the manual `POST /evaluate` route does — it calls `evaluationService.evaluate()`. The queue is just a new way to trigger the same logic.
+
+**`concurrency: 3`** — process up to 3 jobs simultaneously. This is a deliberate choice: fast enough to keep up with news volume, slow enough to stay within Anthropic API rate limits. This number can be tuned in future.
+
+**`worker.on('failed')`** — logs failures with the job ID and error message. When MVP 3 adds monitoring, these events will feed into Sentry or a metrics dashboard.
+
+The worker is started by importing the file in `index.ts`:
+```typescript
+import './workers/evaluationWorker';
+```
+
+Node.js executes the file on import, which instantiates the `Worker` object and begins listening on the queue immediately when the server starts.
+
+---
+
+### /health/pipeline Endpoint
+
+```typescript
+app.get('/health/pipeline', async (_req, res) => {
+  const [waiting, active, failed] = await Promise.all([
+    evaluationQueue.getWaitingCount(),
+    evaluationQueue.getActiveCount(),
+    evaluationQueue.getFailedCount(),
+  ]);
+  res.json({ waiting, active, failed, timestamp: new Date().toISOString() });
+});
+```
+
+This endpoint gives a real-time snapshot of the queue state. Useful for debugging and will feed the pipeline health dashboard in MVP 3. `Promise.all` fetches all three counts in parallel — one round trip to Redis instead of three.
+
+---
+
+### What comes next?
+
+The queue infrastructure is in place. TTA-007 connects to the Polygon.io News API, polls it every 60 seconds, and pushes relevant jobs onto the evaluation queue automatically.
