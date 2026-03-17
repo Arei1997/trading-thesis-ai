@@ -723,3 +723,144 @@ curl -X POST http://localhost:3001/evaluate \
 ### What comes next?
 
 TTA-005 builds the frontend — a Next.js UI with three views: a form to create theses, a manual news input form to trigger evaluations, and a colour-coded result display (green = SUPPORTS, red = WEAKENS, grey = NEUTRAL).
+
+---
+
+## TTA-005 — Frontend UI
+
+### What are we doing?
+
+This PR builds the web interface for MVP 1. Three screens: a thesis list with a create form, a thesis detail page with a news evaluation form, and colour-coded evaluation results. No auth yet — a fixed demo user ID is used throughout.
+
+---
+
+### New Files
+
+```
+apps/frontend/src/
+├── lib/
+│   └── api.ts                     ← typed API client (fetch wrapper)
+├── components/
+│   └── EvaluationResult.tsx       ← colour-coded result card
+└── app/
+    ├── page.tsx                   ← home: thesis list + create form
+    └── theses/[id]/
+        └── page.tsx               ← thesis detail: evaluate form + history
+```
+
+---
+
+### Next.js App Router
+
+Next.js 14 uses the **App Router** — a file-based routing system where the folder structure under `src/app/` defines the URL structure:
+
+| File | URL |
+|------|-----|
+| `src/app/page.tsx` | `/` |
+| `src/app/theses/[id]/page.tsx` | `/theses/abc-123` |
+
+`[id]` is a **dynamic segment** — Next.js captures whatever is in that URL position and makes it available via `useParams()`. This is how the thesis detail page knows which thesis to load.
+
+---
+
+### 'use client' Directive
+
+Next.js 14 defaults all components to **Server Components** — they render on the server and send HTML to the browser. Server components cannot use `useState`, `useEffect`, or browser APIs.
+
+Our pages need interactivity (forms, button clicks, live updates), so they are marked `'use client'` at the top of the file. This tells Next.js to render them in the browser as standard React components.
+
+The rule of thumb: mark a component `'use client'` only when it needs interactivity. Static UI (headers, layout, purely visual elements) should stay as server components where possible for better performance.
+
+---
+
+### The API Client (src/lib/api.ts)
+
+Rather than scattering `fetch` calls across components, all API communication is centralised in a single typed client.
+
+```typescript
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  if (!res.ok) throw new Error(`API error ${res.status}`);
+  return res.json();
+}
+```
+
+The generic `<T>` parameter lets callers declare what type they expect back:
+
+```typescript
+const theses = await request<Thesis[]>('/theses');
+// TypeScript knows `theses` is a Thesis array — full autocomplete, no casting
+```
+
+`BASE_URL` reads from `NEXT_PUBLIC_API_URL` in the environment. In Next.js, only environment variables prefixed with `NEXT_PUBLIC_` are exposed to the browser bundle. Any variable without that prefix stays server-side only.
+
+**`DEMO_USER_ID`** — since MVP 1 has no auth, every thesis is created under a fixed UUID. This is a known placeholder that will be replaced by the real authenticated user ID when auth is added in MVP 3.
+
+---
+
+### The EvaluationResult Component (src/components/EvaluationResult.tsx)
+
+The colour coding maps directly to impact direction:
+
+```typescript
+const impactStyles = {
+  SUPPORTS: 'border-green-500 bg-green-500/10 text-green-400',
+  WEAKENS:  'border-red-500  bg-red-500/10  text-red-400',
+  NEUTRAL:  'border-gray-500 bg-gray-500/10 text-gray-400',
+};
+```
+
+`bg-green-500/10` — Tailwind's opacity modifier syntax. `green-500` is the base colour, `/10` means 10% opacity. This gives a subtle tinted background without being visually overwhelming.
+
+The component is purely presentational — it receives an `Evaluation` object and renders it. No state, no API calls. This makes it trivially reusable: the same card appears both as the "latest result" immediately after an evaluation runs and in the historical list below.
+
+---
+
+### Home Page (src/app/page.tsx)
+
+The home page manages two pieces of state:
+
+- `theses` — the list fetched from the API on mount and after any mutation
+- `showForm` / `form` — controls the create thesis form
+
+**Optimistic UI pattern** — after deleting a thesis, it is removed from local state immediately (`setTheses(prev => prev.filter(...))`) without waiting for a refetch. The UI feels instant. For creates, we do refetch to get the server-assigned ID and timestamps.
+
+**`line-clamp-2`** — a Tailwind utility that truncates text to 2 lines with an ellipsis. Keeps the list clean regardless of thesis text length.
+
+---
+
+### Thesis Detail Page (src/app/theses/[id]/page.tsx)
+
+`Promise.all` loads the thesis and its evaluation history in parallel — one round trip instead of two:
+
+```typescript
+const [t, evals] = await Promise.all([
+  api.theses.get(id),
+  api.evaluations.listByThesis(id),
+]);
+```
+
+After an evaluation is submitted, two things happen:
+1. `latestEvaluation` is set so the result appears immediately below the form with a "Latest result" label
+2. The full `evaluations` array is prepended with the new result so the history list updates instantly
+
+The `newsBody` field is sent as `undefined` (not an empty string) when left blank. The backend accepts `null` / missing for that field — sending an empty string would pass Zod's `z.string()` check but is semantically wrong.
+
+---
+
+### What is MVP 1 complete?
+
+With TTA-005 merged, the full MVP 1 loop is working end-to-end:
+
+1. Open the app at `localhost:3000`
+2. Create a thesis (asset, direction, thesis text)
+3. Click **Evaluate** on a thesis
+4. Paste a news headline and optional body
+5. Click **Run Evaluation** — the backend calls Claude, gets a structured assessment, stores it
+6. The result appears colour-coded: green (SUPPORTS), red (WEAKENS), grey (NEUTRAL)
+7. All past evaluations are shown in the history list below
+
+**Next: MVP 2** — connect to real financial news APIs (Polygon.io, Finnhub), build a Redis-backed ingestion pipeline, and automate the evaluation loop so it runs continuously without manual input.
