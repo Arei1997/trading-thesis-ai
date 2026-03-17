@@ -1401,3 +1401,117 @@ Two reasons:
 ### What comes next?
 
 TTA-010 builds the alert dispatcher — when a high-confidence evaluation is stored, it sends an email to the user with the impact summary.
+
+---
+
+## TTA-010 — Alert Dispatcher (Email)
+
+### What are we doing?
+
+When a high-confidence evaluation is stored, the user needs to know about it immediately — not when they next open the app. This PR adds the email alert dispatcher: after every evaluation, if the confidence score meets or exceeds the thesis's `alertThreshold`, an HTML email is sent to the user via Resend.
+
+---
+
+### Why Resend?
+
+The traditional approach to sending email in Node.js is SMTP — configure a mail server, set credentials, handle TLS. This works but is painful to set up and unreliable in development.
+
+Resend is an API-first email service with a TypeScript SDK. Sending an email is:
+
+```typescript
+await resend.emails.send({
+  from: 'alerts@tradingthesisai.com',
+  to: 'user@example.com',
+  subject: '[WEAKENS] Crude Oil — 85% confidence',
+  html: '...',
+});
+```
+
+Free tier: 100 emails/day, 3,000/month. More than enough for MVP 2 beta.
+
+---
+
+### New File: src/services/alertService.ts
+
+The alert service has one responsibility: given a fully-loaded evaluation (with its thesis and user), send an email.
+
+**Guard clause:**
+```typescript
+if (!process.env.RESEND_API_KEY) {
+  console.warn('[alert] RESEND_API_KEY not set — skipping email');
+  return;
+}
+```
+
+If the key is missing (e.g. in local development without Resend set up), the alert is skipped gracefully — the evaluation is still stored, the system keeps running.
+
+**HTML email template** — the `buildHtml` function produces a clean, readable HTML email with:
+- Colour-coded impact direction header (green/red/grey)
+- Asset name, direction, confidence score
+- The news headline that triggered the evaluation
+- The LLM's reasoning
+- Key risk factors as a bullet list
+- Suggested action in a highlighted box
+
+The email is entirely self-contained — no external CSS, no images, inline styles only. This ensures it renders correctly across all email clients (Gmail, Outlook, Apple Mail).
+
+---
+
+### Where the Alert Fires (evaluationService.ts)
+
+The alert is triggered inside `evaluate()`, after the evaluation row is created:
+
+```typescript
+const thesis = await db.thesis.findUnique({
+  where: { id: input.thesisId },
+  include: { user: true },
+});
+
+// ... LLM call, evaluation created ...
+
+if (result.confidence >= thesis.alertThreshold) {
+  await sendAlert({ ...evaluation, thesis });
+}
+```
+
+Two changes from before:
+1. The thesis query now `include`s `user` — we need the user's email address to send the alert.
+2. After storing the evaluation, confidence is compared against `thesis.alertThreshold` (default 70). Only evaluations that clear the threshold trigger an email.
+
+This means a thesis set to `alertThreshold: 90` will only alert on very high-confidence evaluations. A thesis set to `50` will alert more aggressively. The user controls this — TTA-013 will add the UI to configure it.
+
+---
+
+### Alert Flow End-to-End
+
+```
+News arrives
+  → processSignal (dedup + relevance match)
+  → evaluationQueue.add(job)
+  → evaluationWorker picks up job
+  → evaluationService.evaluate()
+      → callLLM() → structured result
+      → db.evaluation.create()
+      → confidence >= alertThreshold?
+          YES → sendAlert() → Resend API → email delivered
+          NO  → skip
+```
+
+---
+
+### Getting a Resend API Key
+
+1. Go to `https://resend.com` → sign up free
+2. Go to **API Keys** → **Create API Key**
+3. Add to `apps/backend/.env`:
+```
+RESEND_API_KEY="re_..."
+```
+
+For the `from` address to work in production, you need to verify a domain in Resend. For development/testing, Resend allows sending to your own verified email address without a custom domain.
+
+---
+
+### What comes next?
+
+TTA-011 and TTA-012 are merged into TTA-013 — the frontend update. We'll add the live signal feed, filterable evaluation history, and the alert threshold slider to the UI, completing MVP 2.
