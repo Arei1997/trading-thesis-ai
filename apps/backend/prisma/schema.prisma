@@ -23,9 +23,10 @@ model Thesis {
   assetName   String        @map("asset_name")
   direction   Direction
   thesisText  String        @map("thesis_text")
-  status      ThesisStatus  @default(ACTIVE)
-  createdAt   DateTime      @default(now()) @map("created_at")
-  updatedAt   DateTime      @updatedAt @map("updated_at")
+  status          ThesisStatus  @default(ACTIVE)
+  alertThreshold  Int           @default(70) @map("alert_threshold")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
 
   user        User          @relation(fields: [userId], references: [id])
   evaluations Evaluation[]
@@ -48,6 +49,19 @@ model Evaluation {
   thesis Thesis @relation(fields: [thesisId], references: [id])
 
   @@map("evaluations")
+}
+
+model Signal {
+  id          String   @id @default(uuid())
+  headline    String
+  body        String?
+  source      String
+  tickers     String[]
+  url         String
+  publishedAt DateTime @map("published_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("signals")
 }
 
 enum Direction {

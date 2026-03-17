@@ -3,6 +3,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { thesesRouter } from './routes/theses';
 import { evaluateRouter } from './routes/evaluate';
+import { signalsRouter } from './routes/signals';
+import { evaluationsRouter } from './routes/evaluations';
 import { evaluationQueue } from './lib/queue';
 import './workers/evaluationWorker';
 import { startPolygonPoller } from './ingestion/polygonPoller';
@@ -32,6 +34,8 @@ app.get('/health/pipeline', async (_req, res) => {
 
 app.use('/theses', thesesRouter);
 app.use('/evaluate', evaluateRouter);
+app.use('/signals', signalsRouter);
+app.use('/evaluations', evaluationsRouter);
 
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);

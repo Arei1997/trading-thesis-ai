@@ -37,6 +37,17 @@ const findMatchingTheses = async (signal: NormalisedSignal) => {
 export const processSignal = async (signal: NormalisedSignal): Promise<void> => {
   if (await isDuplicate(signal)) return;
 
+  await db.signal.create({
+    data: {
+      headline: signal.headline,
+      body: signal.body || null,
+      source: signal.source,
+      tickers: signal.tickers,
+      url: signal.url,
+      publishedAt: new Date(signal.publishedAt),
+    },
+  });
+
   const matchingTheses = await findMatchingTheses(signal);
   if (matchingTheses.length === 0) return;
 
