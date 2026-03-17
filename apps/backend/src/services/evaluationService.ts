@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { ImpactDirection, SuggestedAction } from '@prisma/client';
 import { db } from '../lib/db';
+import { sendAlert } from './alertService';
 import {
   EVALUATOR_SYSTEM_PROMPT,
   EVALUATOR_TOOL,
@@ -53,7 +54,10 @@ const callLLM = async (
 };
 
 const evaluate = async (input: EvaluateInput) => {
-  const thesis = await db.thesis.findUnique({ where: { id: input.thesisId } });
+  const thesis = await db.thesis.findUnique({
+    where: { id: input.thesisId },
+    include: { user: true },
+  });
   if (!thesis) return null;
 
   const result = await callLLM(
@@ -64,7 +68,7 @@ const evaluate = async (input: EvaluateInput) => {
     input.newsBody,
   );
 
-  return db.evaluation.create({
+  const evaluation = await db.evaluation.create({
     data: {
       thesisId: input.thesisId,
       newsHeadline: input.newsHeadline,
@@ -76,6 +80,12 @@ const evaluate = async (input: EvaluateInput) => {
       keyRiskFactors: result.keyRiskFactors,
     },
   });
+
+  if (result.confidence >= thesis.alertThreshold) {
+    await sendAlert({ ...evaluation, thesis });
+  }
+
+  return evaluation;
 };
 
 const getByThesis = (thesisId: string) => {

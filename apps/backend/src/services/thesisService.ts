@@ -22,6 +22,7 @@ const create = (data: CreateThesisInput) => {
 
 const getAll = () => {
   return db.thesis.findMany({
+    where: { status: { not: 'CLOSED' } },
     orderBy: { createdAt: 'desc' },
   });
 };
