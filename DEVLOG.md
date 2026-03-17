@@ -1286,3 +1286,118 @@ The same deduplication hash prevents the same story from being processed twice, 
 ### What comes next?
 
 TTA-009 adds the `/signals` and `/evaluations` API endpoints so the frontend can display the live signal feed and filterable evaluation history. TTA-010 follows with the alert dispatcher — email notifications when a high-confidence evaluation arrives.
+
+---
+
+## TTA-009 — Signals & Evaluations API Endpoints
+
+### What are we doing?
+
+The pipeline is now running — signals flow in, get matched, and evaluations are stored. But the frontend has no way to display any of this yet. This PR adds the `GET /signals` and `GET /evaluations` endpoints, persists signals to a new `signals` table, and adds a per-thesis `alertThreshold` field so users can configure their own confidence cutoff.
+
+---
+
+### Schema Changes
+
+**New `signals` table** — every article that passes deduplication is now persisted to the database, regardless of whether it matched any thesis. This gives us a complete feed of all processed news, not just the ones that triggered evaluations.
+
+```prisma
+model Signal {
+  id          String   @id @default(uuid())
+  headline    String
+  body        String?
+  source      String
+  tickers     String[]
+  url         String
+  publishedAt DateTime @map("published_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+}
+```
+
+**`alertThreshold` on `Thesis`** — a per-thesis integer (0–100) defaulting to 70. The alert dispatcher (TTA-010) will only send an alert when an evaluation's confidence meets or exceeds this threshold. Different traders have different risk tolerances — a thesis on a volatile asset might warrant a lower threshold.
+
+```prisma
+alertThreshold Int @default(70) @map("alert_threshold")
+```
+
+Both changes are applied via a Prisma migration (`add_signals_and_alert_threshold`), which generates the SQL and runs it against the database automatically.
+
+---
+
+### New Files
+
+```
+apps/backend/src/
+├── services/
+│   ├── signalService.ts      ← fetches recent signals from DB
+│   └── evaluationsService.ts ← filterable evaluation list with thesis join
+└── routes/
+    ├── signals.ts            ← GET /signals
+    └── evaluations.ts        ← GET /evaluations (filterable)
+```
+
+---
+
+### GET /signals
+
+Returns the 50 most recent processed signals, newest first:
+
+```bash
+GET /signals
+```
+
+```json
+[
+  {
+    "id": "...",
+    "headline": "OPEC extends production cuts through Q3",
+    "source": "Reuters",
+    "tickers": [],
+    "publishedAt": "2026-03-17T14:00:00.000Z"
+  }
+]
+```
+
+---
+
+### GET /evaluations (with filters)
+
+The evaluations endpoint supports query parameters for filtering:
+
+```bash
+GET /evaluations?thesisId=<uuid>&impactDirection=WEAKENS&from=2026-03-01&limit=20
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `thesisId` | UUID | Filter by thesis |
+| `impactDirection` | `SUPPORTS` \| `WEAKENS` \| `NEUTRAL` | Filter by impact |
+| `from` | ISO date | Evaluations after this date |
+| `to` | ISO date | Evaluations before this date |
+| `limit` | number | Max results (default 100) |
+
+The response includes a `thesis` join — each evaluation carries `{ assetName, direction }` so the frontend can display context without a separate request:
+
+```typescript
+include: { thesis: { select: { assetName: true, direction: true } } }
+```
+
+This is a Prisma **relation include** — a single query with a JOIN, not two separate queries. Prisma generates the SQL automatically from the schema relation.
+
+---
+
+### Why Persist Signals?
+
+You might ask: why store signals at all? The evaluations table already has the headline.
+
+Two reasons:
+
+1. **Audit trail** — we store every processed article, not just the ones that matched a thesis. If a user adds a new thesis later, we can see what relevant news existed before it was created.
+
+2. **Signal feed UI** — the frontend signal feed (TTA-013) shows all recent news the system has seen, not just the ones that triggered evaluations. This gives traders a live view of what the system is monitoring, building trust in the product.
+
+---
+
+### What comes next?
+
+TTA-010 builds the alert dispatcher — when a high-confidence evaluation is stored, it sends an email to the user with the impact summary.
