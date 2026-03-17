@@ -567,3 +567,159 @@ curl -X DELETE http://localhost:3001/theses/<id>
 ### What comes next?
 
 TTA-004 adds the `POST /evaluate` endpoint — the core of the product. It accepts a thesis ID and a news headline, sends both to the Claude API with a versioned structured prompt, and returns a typed impact assessment (`SUPPORTS` / `WEAKENS` / `NEUTRAL`) with a confidence score, reasoning, suggested action, and key risk factors.
+
+---
+
+## TTA-004 — LLM Evaluator
+
+### What are we doing?
+
+This is the core feature of the product. Given a thesis and a news headline, this endpoint sends both to the Claude API and returns a structured assessment of how that news impacts the trade. The response is persisted to the `evaluations` table and returned to the client.
+
+---
+
+### New Files
+
+```
+apps/backend/src/
+├── prompts/
+│   └── thesis-evaluator-v1.ts  ← versioned system prompt + tool definition
+└── services/
+    └── evaluationService.ts    ← calls Anthropic, writes evaluation to DB
+routes/
+    └── evaluate.ts             ← POST /evaluate, GET /evaluate/:thesisId
+```
+
+---
+
+### Why Tool Use Instead of Plain Prompting?
+
+The naive approach would be to ask the LLM to "return a JSON object" in plain text and then parse the response with `JSON.parse`. This is fragile — the model might add a preamble ("Sure, here is the evaluation:"), wrap in markdown code fences, or include trailing text. Any of these breaks the parse.
+
+Anthropic's **tool use** feature solves this at the API level. You define a tool with a strict JSON schema, and set `tool_choice: { type: "any" }` to force the model to call it. The model cannot return prose — it must populate the tool's input fields. The SDK returns the result in a structured `tool_use` block, not a raw string.
+
+The result: **100% parseable output, guaranteed by the API**.
+
+```typescript
+tool_choice: { type: 'any' }
+```
+
+`'any'` means "you must call one of the provided tools". Since we only provide one tool (`submit_evaluation`), the model is forced to call it. There is no escape hatch to free-text prose.
+
+---
+
+### The Prompt (src/prompts/thesis-evaluator-v1.ts)
+
+The prompt is stored as a versioned file, not an inline string. This is a deliberate engineering practice:
+
+- **Versioning** — `v1` in the filename means we can create `v2` later without touching anything that uses `v1`. This matters for A/B testing and prompt regression tracking.
+- **Single source of truth** — every evaluation in production uses the same prompt. If a bug is found in the prompt, fixing the file fixes all future evaluations.
+- **Reviewable in git** — prompt changes show up as code diffs in PRs, the same as any other logic change.
+
+**System prompt** — sets the model's persona and constraints before any user content arrives:
+```
+You are a financial analysis assistant specialising in evaluating how news events impact
+active trading positions. You are precise, concise, and non-speculative.
+```
+"Non-speculative" is a critical instruction. Without it, the model might infer implications beyond what the news actually states, producing confident-sounding assessments based on reasoning rather than evidence.
+
+**User prompt builder** — `buildEvaluatorUserPrompt` takes the thesis fields and news content and formats them into the structured prompt the model receives. News body is capped at 2,000 characters — longer inputs push the context towards the token limit and increase cost without proportionally improving evaluation quality.
+
+**Tool definition** — the `input_schema` defines exactly what the model must return:
+
+```typescript
+{
+  impactDirection: 'SUPPORTS' | 'WEAKENS' | 'NEUTRAL',
+  confidence: number,          // 0–100
+  reasoning: string,           // 2–3 sentences
+  suggestedAction: 'HOLD' | 'REVIEW' | 'CONSIDER_CLOSING',
+  keyRiskFactors: string[]     // up to 3 items
+}
+```
+
+Every field maps directly to a column in the `evaluations` table. There is no transformation layer between what the LLM returns and what gets stored.
+
+---
+
+### The Evaluation Service (src/services/evaluationService.ts)
+
+The service is split into two clear responsibilities:
+
+**`callLLM`** — a private function that handles the Anthropic API call. It constructs the request, fires it, and extracts the tool use block from the response. If the model somehow fails to call the tool, it throws — we do not silently store a null result.
+
+**`evaluate`** — the public function. It:
+1. Fetches the thesis from the database (returns `null` if not found — the route returns 404)
+2. Calls `callLLM` with the thesis fields and news content
+3. Persists the result to the `evaluations` table
+4. Returns the created evaluation record
+
+This means every evaluation is **logged permanently**. Even if the user never looks at it again, the data is there for future features — thesis health scores (MVP 3), price correlation (MVP 4), and prompt improvement analysis.
+
+---
+
+### The Anthropic Client
+
+```typescript
+const client = new Anthropic();
+```
+
+The SDK reads `ANTHROPIC_API_KEY` from `process.env` automatically. No config needed — as long as the key is in `.env`, it works.
+
+```typescript
+model: 'claude-sonnet-4-6',
+max_tokens: 1024,
+```
+
+`claude-sonnet-4-6` — the current production Sonnet model. Fast enough for sub-4-second responses, capable enough for financial reasoning.
+
+`max_tokens: 1024` — caps the response length. Tool use responses are structured and compact — 1,024 tokens is more than enough and prevents runaway costs if the model tries to over-explain.
+
+---
+
+### The Routes (src/routes/evaluate.ts)
+
+| Method | Path | What it does |
+|--------|------|-------------|
+| `POST` | `/evaluate` | Run an evaluation against a thesis |
+| `GET` | `/evaluate/:thesisId` | List all evaluations for a thesis |
+
+The `POST` route accepts:
+```json
+{
+  "thesisId": "<uuid>",
+  "newsHeadline": "OPEC agrees to extend production cuts through Q3",
+  "newsBody": "Optional full article text..."
+}
+```
+
+And returns the full stored evaluation, including the LLM's `impactDirection`, `confidence`, `reasoning`, `suggestedAction`, and `keyRiskFactors`.
+
+---
+
+### Testing the Evaluator
+
+```bash
+# First create a thesis, then run an evaluation against it:
+curl -X POST http://localhost:3001/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "thesisId": "<your-thesis-id>",
+    "newsHeadline": "OPEC agrees to extend production cuts through Q3",
+    "newsBody": "OPEC and its allies agreed on Sunday to extend production cuts of 3.66 million barrels per day through the end of Q3, supporting oil prices amid demand uncertainty."
+  }'
+
+# Expected response:
+{
+  "impactDirection": "SUPPORTS",
+  "confidence": 82,
+  "reasoning": "The OPEC production cut extension directly reduces supply, which supports the long oil thesis based on supply restriction. This is a fundamental catalyst aligned with the original thesis reasoning.",
+  "suggestedAction": "HOLD",
+  "keyRiskFactors": ["Demand-side weakness could offset supply cuts", "Compliance risk among OPEC members", "USD strength may cap oil price upside"]
+}
+```
+
+---
+
+### What comes next?
+
+TTA-005 builds the frontend — a Next.js UI with three views: a form to create theses, a manual news input form to trigger evaluations, and a colour-coded result display (green = SUPPORTS, red = WEAKENS, grey = NEUTRAL).
