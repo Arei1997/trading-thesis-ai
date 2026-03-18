@@ -121,6 +121,29 @@ pnpm dev
 
 Open `http://localhost:3000`.
 
+### 5. Inspect the database
+
+Run Prisma Studio for a visual browser of all tables:
+
+```bash
+cd apps/backend
+pnpm prisma studio
+```
+
+Open `http://localhost:5555`. You can browse `theses`, `evaluations`, and `signals`, edit rows, and filter data.
+
+Alternatively, use psql directly:
+
+```bash
+psql -U postgres -d trading_thesis_ai
+
+# useful queries
+SELECT id, user_id, asset_name, status FROM theses;
+SELECT * FROM evaluations ORDER BY created_at DESC LIMIT 10;
+\dt   -- list all tables
+\q    -- quit
+```
+
 ---
 
 ## How the pipeline works
@@ -182,7 +205,7 @@ RSS Feeds (5min)         ─┘        │
 |-----|--------|-------|
 | MVP 1 | Complete | Thesis CRUD + manual LLM evaluation |
 | MVP 2 | Complete | Live news ingestion, signal pipeline, email alerts, signal feed UI |
-| MVP 3 | Planned | Thesis health scores, multi-channel alerts, auth (Clerk) |
+| MVP 3 | In progress | Auth (Clerk), thesis health scores, multi-channel alerts |
 | MVP 4 | Planned | Broker integration, price correlation, AI thesis suggestions |
 
 ---
