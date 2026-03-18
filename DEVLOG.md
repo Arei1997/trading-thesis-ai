@@ -1744,3 +1744,86 @@ MVP 3 continues with:
 - **Thesis health scores** — a rolling confidence trend derived from recent evaluations
 - **Multi-channel alerts** — Slack webhooks alongside email
 
+---
+
+## TTA-015 — Thesis Health Score
+
+### What is a health score?
+
+A thesis doesn't just exist in a binary state of "right" or "wrong". It accumulates evidence over time — some news supports it, some weakens it. A trader looking at a thesis wants to know at a glance: *is this holding up?*
+
+The health score answers that question as a single number: **0–100**. It is computed from the last 10 evaluations against a thesis and shown as a colour-coded badge on every thesis card and detail page.
+
+---
+
+### The formula
+
+```
+signed_confidence = confidence  (if SUPPORTS)
+                  = -confidence (if WEAKENS)
+                  = 0           (if NEUTRAL)
+
+raw = sum(signed_confidence) / count   → range: [-100, +100]
+health = round((raw + 100) / 2)        → range: [0, 100]
+```
+
+Example: 5 evaluations — two SUPPORTS at 80%, one WEAKENS at 60%, two NEUTRAL:
+
+```
+raw = (80 + 80 - 60 + 0 + 0) / 5 = 20
+health = round((20 + 100) / 2) = 60  →  yellow
+```
+
+Using the last 10 evaluations (not all-time) keeps the score responsive to recent news while smoothing out single outliers.
+
+---
+
+### Where the score is computed
+
+Health score is **computed in the service layer, not stored**. There is no `healthScore` column in the database. The `thesisService.getAll()` and `getById()` functions fetch the last 10 evaluations via a Prisma `include`, run `computeHealthScore()`, and attach the result to the returned object before it leaves the service.
+
+```typescript
+const HEALTH_INCLUDE = {
+  evaluations: {
+    orderBy: { createdAt: 'desc' },
+    take: 10,
+    select: { impactDirection: true, confidence: true },
+  },
+};
+```
+
+`take: 10` — Prisma applies this as a `LIMIT` in SQL, so only 10 rows are fetched per thesis regardless of how large the evaluation history is. The cost is O(1) per thesis, not O(n).
+
+`select: { impactDirection, confidence }` — only the two fields needed for the computation are fetched. No unnecessary data transfer.
+
+---
+
+### Why not store the score?
+
+Storing a derived value creates two sources of truth that can drift out of sync. If an evaluation is added and the stored score is not updated atomically, they diverge. Computing on read means the score is always exact and requires zero maintenance. At the scale of this product (tens of theses per user, 10 evaluations per query), the compute cost is negligible.
+
+---
+
+### Colour thresholds
+
+| Score | Colour | Meaning |
+|-------|--------|---------|
+| 70–100 | Green | Thesis is well-supported by recent news |
+| 40–69 | Yellow | Mixed signals — worth monitoring |
+| 0–39 | Red | Thesis is under pressure from recent news |
+| null | Hidden | No evaluations yet — score not shown |
+
+`null` is the explicit case for a thesis with no evaluations. Showing "Health 50" (neutral midpoint) for a thesis with zero data would be misleading — so it's hidden entirely.
+
+---
+
+### PATCH response now includes health score
+
+Previously, `PATCH /theses/:id` returned the raw Prisma `update()` result — a plain thesis object without health score. After this PR it calls `getById()` after the update, so the response includes the computed score. This matters for the alert threshold slider: when the user saves the threshold and the page syncs state from the response, it now has a valid health score too.
+
+---
+
+### What comes next?
+
+- **Slack alerts** — webhook-based notifications as a second alert channel alongside email
+

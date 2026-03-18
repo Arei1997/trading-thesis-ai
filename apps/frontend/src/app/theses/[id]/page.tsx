@@ -86,6 +86,15 @@ export default function ThesisPage() {
               {thesis.direction}
             </span>
             <h2 className="text-xl font-bold">{thesis.assetName}</h2>
+            {thesis.healthScore !== null && (
+              <span className={`ml-auto text-sm font-semibold px-3 py-1 rounded-lg ${
+                thesis.healthScore >= 70 ? 'bg-green-500/20 text-green-400' :
+                thesis.healthScore >= 40 ? 'bg-yellow-500/20 text-yellow-400' :
+                                           'bg-red-500/20 text-red-400'
+              }`}>
+                Health {thesis.healthScore}/100
+              </span>
+            )}
           </div>
           <p className="text-gray-400 text-sm leading-relaxed">{thesis.thesisText}</p>
         </div>

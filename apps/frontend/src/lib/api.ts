@@ -15,6 +15,7 @@ export interface Thesis {
   thesisText: string;
   status: ThesisStatus;
   alertThreshold: number;
+  healthScore: number | null;
   createdAt: string;
   updatedAt: string;
 }

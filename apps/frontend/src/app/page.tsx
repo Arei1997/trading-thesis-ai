@@ -15,6 +15,19 @@ const directionBadge: Record<Direction, string> = {
   SHORT: 'bg-orange-500/20 text-orange-400',
 };
 
+function HealthBadge({ score }: { score: number | null }) {
+  if (score === null) return null;
+  const colour =
+    score >= 70 ? 'bg-green-500/20 text-green-400' :
+    score >= 40 ? 'bg-yellow-500/20 text-yellow-400' :
+                  'bg-red-500/20 text-red-400';
+  return (
+    <span className={`text-xs font-medium px-2 py-0.5 rounded ${colour}`}>
+      Health {score}
+    </span>
+  );
+}
+
 export default function Home() {
   const api = useApi();
   const [theses, setTheses] = useState<Thesis[]>([]);
@@ -116,6 +129,7 @@ export default function Home() {
                       <span className={`text-xs font-medium px-2 py-0.5 rounded ${statusBadge[thesis.status]}`}>
                         {thesis.status}
                       </span>
+                      <HealthBadge score={thesis.healthScore} />
                       <span className="font-semibold text-white">{thesis.assetName}</span>
                     </div>
                     <p className="text-sm text-gray-400 line-clamp-2">{thesis.thesisText}</p>
