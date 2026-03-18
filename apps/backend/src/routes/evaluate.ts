@@ -1,8 +1,11 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { evaluationService } from '../services/evaluationService';
+import { requireAuth } from '../middleware/requireAuth';
 
 export const evaluateRouter = Router();
+
+evaluateRouter.use(requireAuth);
 
 const evaluateSchema = z.object({
   thesisId: z.string().uuid(),

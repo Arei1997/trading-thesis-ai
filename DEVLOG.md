@@ -1556,3 +1556,191 @@ MVP 2 is complete. MVP 3 introduces:
 - **Multi-channel alerts** — Slack webhooks and SMS alongside email
 - **Auth** — Clerk replaces the hardcoded demo user ID
 
+---
+
+## TTA-014 — Clerk Auth
+
+### The problem with DEMO_USER_ID
+
+Every API request up to this point used a hardcoded UUID:
+
+```typescript
+export const DEMO_USER_ID = 'a0000000-0000-0000-0000-000000000001';
+```
+
+This meant all users shared the same data, no route was protected, and there was no concept of identity. MVP 3 starts here — real auth.
+
+---
+
+### Why Clerk?
+
+Clerk is a hosted authentication platform. Instead of building login forms, session management, token refresh, and password hashing yourself, you integrate a few components and the entire auth lifecycle is handled for you.
+
+The alternative (rolling your own with JWTs + bcrypt + sessions) is weeks of work, well-understood attack surface, and not the value this product is trying to create. For an MVP, Clerk is the right call.
+
+---
+
+### Key architectural decision: drop the User model entirely
+
+The original schema had a `User` model with a UUID primary key and a foreign key on `Thesis`:
+
+```prisma
+model User {
+  id     String @id @default(uuid())
+  email  String @unique
+  theses Thesis[]
+}
+
+model Thesis {
+  userId String @map("user_id")
+  user   User   @relation(fields: [userId], references: [id])
+}
+```
+
+Clerk user IDs look like `user_2Nxxx` — they are not UUIDs. Keeping the FK would require syncing every Clerk user creation/deletion event via webhooks to keep the `users` table in sync with Clerk's state. That's operational overhead for no gain.
+
+The decision: drop the `User` model and the FK entirely. `userId` on `Thesis` stays as a plain `String` with no relation:
+
+```prisma
+model Thesis {
+  userId String @map("user_id")  -- plain string, no FK
+}
+```
+
+The migration is two lines:
+
+```sql
+ALTER TABLE "theses" DROP CONSTRAINT "theses_user_id_fkey";
+DROP TABLE "users";
+```
+
+Clerk is now the source of truth for user identity. The database never needs to know about the `User` table — it just stores the Clerk ID as an opaque string.
+
+---
+
+### Backend: Clerk middleware
+
+`@clerk/express` provides two things we use:
+
+**`clerkMiddleware()`** — registers Clerk's authentication state on every request. This doesn't reject anything — it just makes `getAuth(req)` available downstream. Applied globally after `express.json()`.
+
+**`getAuth(req)`** — extracts the authenticated user's ID from the request. Returns `{ userId: string | null }`. If no valid session token was sent, `userId` is null.
+
+**`requireAuth`** — our thin guard that checks `userId` and returns 401 if absent:
+
+```typescript
+export function requireAuth(req, res, next) {
+  const { userId } = getAuth(req);
+  if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+  next();
+}
+```
+
+Applied as `router.use(requireAuth)` at the top of every route file. Health endpoints (`/health`, `/health/pipeline`) are intentionally left unprotected — they need to be reachable by uptime monitors without credentials.
+
+---
+
+### Ownership checks on PATCH and DELETE
+
+Previously there was no concept of "this thesis belongs to this user". Any authenticated user could mutate any thesis by ID. With real auth, we add an ownership check before mutating:
+
+```typescript
+const thesis = await thesisService.getById(req.params.id);
+if (!thesis) { res.status(404).json({ error: 'Thesis not found' }); return; }
+if (thesis.userId !== userId) { res.status(403).json({ error: 'Forbidden' }); return; }
+```
+
+404 before 403 — we don't reveal that a resource exists to someone who doesn't own it.
+
+---
+
+### User-scoped data
+
+`GET /theses` previously returned all non-closed theses. Now it filters by the authenticated user's ID:
+
+```typescript
+const getAll = (userId: string) => {
+  return db.thesis.findMany({
+    where: { status: { not: 'CLOSED' }, userId },
+    orderBy: { createdAt: 'desc' },
+  });
+};
+```
+
+Two users signing in will each see only their own theses. This is the fundamental requirement for a multi-tenant system.
+
+---
+
+### Alert emails: fetching user email from Clerk
+
+The alert service previously sent emails to `ev.thesis.user.email` — pulled from the now-deleted `User` table. Since Clerk holds user data, we fetch the email at send time using the Clerk backend SDK:
+
+```typescript
+const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+const user = await clerkClient.users.getUser(ev.thesis.userId);
+const primary = user.emailAddresses.find((e) => e.id === user.primaryEmailAddressId);
+```
+
+This is a network call per alert. That's acceptable for an infrequent event (alert fires when confidence ≥ threshold). Caching the email in the database is a future optimisation if it becomes a bottleneck.
+
+---
+
+### Frontend: ClerkProvider and UserButton
+
+`ClerkProvider` wraps the entire app in `layout.tsx`. This is a React context provider that makes Clerk's hooks (`useAuth`, `useUser`) available anywhere in the component tree.
+
+`UserButton` is Clerk's pre-built avatar/dropdown component. Clicking it shows the user's profile and a sign-out option. `afterSignOutUrl="/sign-in"` ensures the user lands on the login page after signing out. It sits in the nav bar with `ml-auto` to push it to the right.
+
+---
+
+### Frontend: Next.js middleware
+
+`src/middleware.ts` runs on every request before it reaches a page. It uses Clerk's `clerkMiddleware` with a route matcher to decide what's public:
+
+```typescript
+const isPublicRoute = createRouteMatcher(['/sign-in(.*)', '/sign-up(.*)']);
+
+export default clerkMiddleware((auth, req) => {
+  if (!isPublicRoute(req)) auth().protect();
+});
+```
+
+`auth().protect()` redirects unauthenticated users to `/sign-in` automatically. The `matcher` config in the export limits which requests Next.js runs the middleware on — static assets (`_next`, images, fonts) are excluded for performance.
+
+---
+
+### Frontend: useApi() hook
+
+The original `api` object was a plain module-level constant — every call was unauthenticated. Clerk tokens are obtained asynchronously via `useAuth().getToken()`, which is a React hook and therefore can only be called inside a component or another hook.
+
+The solution is a `useApi()` hook that captures `getToken` and wraps every request with a Bearer token:
+
+```typescript
+export function useApi() {
+  const { getToken } = useAuth();
+
+  async function authedRequest<T>(path, options) {
+    const token = await getToken();
+    return request<T>(path, options, token ?? undefined);
+  }
+
+  return { theses: { list: () => authedRequest('/theses'), ... }, ... };
+}
+```
+
+Each page component calls `const api = useApi()` once and then uses `api.*` exactly as before — the call sites are unchanged. The token is fetched fresh on every request (Clerk caches it internally and handles refresh transparently).
+
+---
+
+### Sign-in and sign-up pages
+
+Clerk provides `<SignIn />` and `<SignUp />` components that render a complete, styled auth UI. The routes use Next.js catch-all segments (`[[...sign-in]]`) so Clerk can handle its own sub-paths (e.g. `/sign-in/factor-one` for MFA) without needing additional route files.
+
+---
+
+### What comes next?
+
+MVP 3 continues with:
+- **Thesis health scores** — a rolling confidence trend derived from recent evaluations
+- **Multi-channel alerts** — Slack webhooks alongside email
+

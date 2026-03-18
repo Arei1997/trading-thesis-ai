@@ -1,8 +1,11 @@
 import { Router, Request, Response } from 'express';
 import { ImpactDirection } from '@prisma/client';
 import { evaluationsService } from '../services/evaluationsService';
+import { requireAuth } from '../middleware/requireAuth';
 
 export const evaluationsRouter = Router();
+
+evaluationsRouter.use(requireAuth);
 
 evaluationsRouter.get('/', async (req: Request, res: Response) => {
   const { thesisId, impactDirection, from, to, limit } = req.query;
