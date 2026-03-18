@@ -1,11 +1,12 @@
 import { Resend } from 'resend';
-import { Evaluation, Thesis, User } from '@prisma/client';
+import { createClerkClient } from '@clerk/express';
+import { Evaluation, Thesis } from '@prisma/client';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 const FROM = 'Trading Thesis AI <onboarding@resend.dev>';
 
 type EvaluationWithThesis = Evaluation & {
-  thesis: Thesis & { user: User };
+  thesis: Thesis;
 };
 
 const impactColour: Record<string, string> = {
@@ -54,12 +55,31 @@ export const sendAlert = async (ev: EvaluationWithThesis): Promise<void> => {
     console.warn('[alert] RESEND_API_KEY not set — skipping email');
     return;
   }
+  if (!process.env.CLERK_SECRET_KEY) {
+    console.warn('[alert] CLERK_SECRET_KEY not set — skipping email');
+    return;
+  }
+
+  let recipientEmail: string;
+  try {
+    const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+    const user = await clerkClient.users.getUser(ev.thesis.userId);
+    const primary = user.emailAddresses.find((e) => e.id === user.primaryEmailAddressId);
+    if (!primary) {
+      console.warn(`[alert] no primary email for user ${ev.thesis.userId} — skipping`);
+      return;
+    }
+    recipientEmail = primary.emailAddress;
+  } catch (err) {
+    console.error('[alert] failed to fetch user email from Clerk:', err);
+    return;
+  }
 
   const subject = `[${ev.impactDirection}] ${ev.thesis.assetName} — ${ev.confidence}% confidence`;
 
   const { error } = await resend.emails.send({
     from: FROM,
-    to: ev.thesis.user.email,
+    to: recipientEmail,
     subject,
     html: buildHtml(ev),
   });
@@ -69,5 +89,5 @@ export const sendAlert = async (ev: EvaluationWithThesis): Promise<void> => {
     return;
   }
 
-  console.log(`[alert] sent to ${ev.thesis.user.email} — ${subject}`);
+  console.log(`[alert] sent to ${recipientEmail} — ${subject}`);
 };

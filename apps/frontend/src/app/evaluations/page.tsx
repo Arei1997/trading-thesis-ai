@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { api, EvaluationWithThesis, ImpactDirection } from '../../lib/api';
+import { useApi, EvaluationWithThesis, ImpactDirection } from '../../lib/api';
 
 const impactColour: Record<ImpactDirection, string> = {
   SUPPORTS: 'text-green-400',
@@ -20,6 +20,7 @@ function fmt(iso: string) {
 }
 
 export default function EvaluationsPage() {
+  const api = useApi();
   const [evaluations, setEvaluations] = useState<EvaluationWithThesis[]>([]);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState<{

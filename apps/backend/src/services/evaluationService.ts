@@ -56,7 +56,6 @@ const callLLM = async (
 const evaluate = async (input: EvaluateInput) => {
   const thesis = await db.thesis.findUnique({
     where: { id: input.thesisId },
-    include: { user: true },
   });
   if (!thesis) return null;
 

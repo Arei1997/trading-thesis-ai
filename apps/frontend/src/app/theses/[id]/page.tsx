@@ -3,10 +3,11 @@
 import { useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { api, Thesis, Evaluation } from '../../../lib/api';
+import { useApi, Thesis, Evaluation } from '../../../lib/api';
 import { EvaluationResult } from '../../../components/EvaluationResult';
 
 export default function ThesisPage() {
+  const api = useApi();
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
 

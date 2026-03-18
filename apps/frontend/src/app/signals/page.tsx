@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { api, Signal } from '../../lib/api';
+import { useApi, Signal } from '../../lib/api';
 
 const sourceLabel: Record<string, string> = {
   polygon: 'Polygon',
@@ -20,6 +20,7 @@ function timeAgo(iso: string) {
 }
 
 export default function SignalsPage() {
+  const api = useApi();
   const [signals, setSignals] = useState<Signal[]>([]);
   const [loading, setLoading] = useState(true);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);

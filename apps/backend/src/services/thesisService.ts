@@ -20,9 +20,9 @@ const create = (data: CreateThesisInput) => {
   return db.thesis.create({ data });
 };
 
-const getAll = () => {
+const getAll = (userId: string) => {
   return db.thesis.findMany({
-    where: { status: { not: 'CLOSED' } },
+    where: { status: { not: 'CLOSED' }, userId },
     orderBy: { createdAt: 'desc' },
   });
 };

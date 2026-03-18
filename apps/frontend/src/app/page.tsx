@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { api, Thesis, Direction } from '../lib/api';
+import { useApi, Thesis, Direction } from '../lib/api';
 
 const statusBadge: Record<Thesis['status'], string> = {
   ACTIVE: 'bg-green-500/20 text-green-400',
@@ -16,6 +16,7 @@ const directionBadge: Record<Direction, string> = {
 };
 
 export default function Home() {
+  const api = useApi();
   const [theses, setTheses] = useState<Thesis[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);

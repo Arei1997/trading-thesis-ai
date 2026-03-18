@@ -7,16 +7,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  createdAt DateTime @default(now()) @map("created_at")
-
-  theses Thesis[]
-
-  @@map("users")
-}
-
 model Thesis {
   id          String        @id @default(uuid())
   userId      String        @map("user_id")
@@ -28,7 +18,6 @@ model Thesis {
   createdAt       DateTime      @default(now()) @map("created_at")
   updatedAt       DateTime      @updatedAt @map("updated_at")
 
-  user        User          @relation(fields: [userId], references: [id])
   evaluations Evaluation[]
 
   @@map("theses")
