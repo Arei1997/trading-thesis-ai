@@ -59,7 +59,8 @@ thesesRouter.patch('/:id', async (req: Request, res: Response) => {
   const thesis = await thesisService.getById(req.params.id);
   if (!thesis) { res.status(404).json({ error: 'Thesis not found' }); return; }
   if (thesis.userId !== userId) { res.status(403).json({ error: 'Forbidden' }); return; }
-  const updated = await thesisService.update(req.params.id, parsed.data);
+  await thesisService.update(req.params.id, parsed.data);
+  const updated = await thesisService.getById(req.params.id);
   res.json(updated);
 });
 
