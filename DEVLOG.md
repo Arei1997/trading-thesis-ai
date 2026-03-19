@@ -14,6 +14,52 @@ For example: you are long oil because you believe Middle East tensions will rest
 
 This first PR sets up the project skeleton: the folder structure, configuration files, and the tooling that every future PR will build on top of.
 
+### System Architecture
+
+```mermaid
+graph TB
+    subgraph FE["Frontend  ·  Next.js 14  ·  :3000"]
+        UI["Pages: Theses / Signals / Evaluations\nClerkProvider · useApi() hook"]
+    end
+
+    subgraph BE["Backend API  ·  Express  ·  :3001"]
+        Routes["Routes\n(theses / evaluate / signals / evaluations)"]
+        Services["Services\n(thesisService · evaluationService · alertService)"]
+        Worker["BullMQ Worker\nconcurrency: 3"]
+    end
+
+    subgraph Ingest["News Ingestion"]
+        Polygon["Polygon.io\n60s REST poll"]
+        Finnhub["Finnhub\nWebSocket"]
+        RSS["RSS Feeds\n5m poll"]
+        SP["Signal Processor\ndedup · relevance match · persist"]
+    end
+
+    subgraph Ext["External Services"]
+        Claude["Anthropic Claude API\nstructured tool use"]
+        Resend["Resend\nemail alerts"]
+        Clerk["Clerk\nauth provider"]
+    end
+
+    subgraph Infra["Infrastructure"]
+        PG[("PostgreSQL\ntheses · evaluations · signals")]
+        Redis[("Redis / Upstash\nBullMQ queue · dedup cache")]
+    end
+
+    UI -->|"Bearer JWT"| Routes
+    Routes --> Services
+    Services --> PG
+    Worker --> Services
+    Worker --> Claude
+    Worker -->|"confidence ≥ threshold"| Resend
+    Polygon & Finnhub & RSS --> SP
+    SP --> Redis
+    SP --> PG
+    Redis -->|"BullMQ jobs"| Worker
+    Clerk -.->|"JWT verification"| Routes
+    Clerk -.->|"session / UserButton"| UI
+```
+
 ---
 
 ### What is a Monorepo?
@@ -274,6 +320,46 @@ The schema file is the single source of truth for the database structure. Prisma
 **datasource block** — tells Prisma which database to connect to. `env("DATABASE_URL")` reads the connection string from the `.env` file at runtime.
 
 ---
+
+### Database Schema
+
+```mermaid
+erDiagram
+    THESIS {
+        String  id              PK
+        String  userId
+        String  assetName
+        String  direction       "LONG | SHORT"
+        String  thesisText
+        String  status          "ACTIVE | PAUSED | CLOSED"
+        Int     alertThreshold  "default 70"
+        DateTime createdAt
+        DateTime updatedAt
+    }
+    EVALUATION {
+        String   id              PK
+        String   thesisId        FK
+        String   newsHeadline
+        String   newsBody
+        String   impactDirection "SUPPORTS | WEAKENS | NEUTRAL"
+        Int      confidence      "0-100"
+        String   reasoning
+        String   suggestedAction "HOLD | REVIEW | CONSIDER_CLOSING"
+        String[] keyRiskFactors
+        DateTime createdAt
+    }
+    SIGNAL {
+        String   id          PK
+        String   headline
+        String   source
+        String[] tickers
+        String   url
+        DateTime publishedAt
+        DateTime createdAt
+    }
+
+    THESIS ||--o{ EVALUATION : "has many"
+```
 
 ### The Models
 
@@ -600,6 +686,27 @@ Anthropic's **tool use** feature solves this at the API level. You define a tool
 
 The result: **100% parseable output, guaranteed by the API**.
 
+```mermaid
+sequenceDiagram
+    participant C  as Client
+    participant R  as POST /evaluate
+    participant S  as evaluationService
+    participant A  as Anthropic API
+    participant DB as PostgreSQL
+
+    C->>R:  { thesisId, newsHeadline, newsBody }
+    R->>S:  evaluate(data)
+    S->>DB: findUnique(thesisId)
+    DB-->>S: Thesis
+    S->>A:  messages + tool schema<br/>tool_choice: "any"
+    Note over A: Model MUST call<br/>submit_evaluation tool —<br/>cannot return prose
+    A-->>S: tool_use block<br/>{ impactDirection, confidence,<br/>  reasoning, suggestedAction,<br/>  keyRiskFactors }
+    S->>DB: evaluation.create(result)
+    DB-->>S: saved Evaluation
+    S-->>R: Evaluation
+    R-->>C: 201 JSON
+```
+
 ```typescript
 tool_choice: { type: 'any' }
 ```
@@ -896,6 +1003,25 @@ With a queue, the flow becomes:
 4. Worker processes them at a controlled rate (concurrency: 3 at a time)
 
 The queue acts as a buffer and a rate limiter in one.
+
+```mermaid
+flowchart LR
+    N["News article"] --> SP["Signal Processor"]
+    SP --> D{Already\nseen?}
+    D -->|yes| Skip["skip"]
+    D -->|no| Match{Matches\nactive thesis?}
+    Match -->|no| Drop["drop"]
+    Match -->|yes| Q[["BullMQ Queue\nRedis"]]
+    Q --> W1["Worker 1"]
+    Q --> W2["Worker 2"]
+    Q --> W3["Worker 3 · · ·"]
+    W1 & W2 & W3 --> LLM["Anthropic API"]
+    LLM --> DB[("PostgreSQL\nevaluations")]
+    DB -->|"confidence ≥ threshold"| Alert["Email Alert\nResend"]
+
+    style Skip fill:#374151,color:#9ca3af
+    style Drop fill:#374151,color:#9ca3af
+```
 
 ---
 
@@ -1273,10 +1399,27 @@ Each feed is polled inside its own try/catch. If the Reuters feed is down, the F
 
 With TTA-008 merged, three independent ingestion paths all converge on `processSignal`:
 
-```
-Polygon.io (60s poll)  ──┐
-Finnhub WebSocket      ──┼──▶ processSignal ──▶ dedup ──▶ relevance match ──▶ queue ──▶ worker ──▶ LLM
-RSS feeds (5m poll)    ──┘
+```mermaid
+flowchart LR
+    P["Polygon.io\n60s poll"]  --> SP
+    F["Finnhub\nWebSocket"]    --> SP
+    R["RSS Feeds\n5m poll"]    --> SP
+
+    SP["processSignal()\nNormalisedSignal"]
+
+    SP -->|"SHA-256 hash"| Dedup{Redis\ndedup?}
+    Dedup -->|"seen"| X["skip"]
+    Dedup -->|"new"| PG1[("signals\ntable")]
+    Dedup -->|"new"| Match{Relevance\nmatch}
+    Match -->|"no match"| Y["drop"]
+    Match -->|"matched"| Q[["BullMQ\nQueue"]]
+    Q --> W["Worker\nconcurrency 3"]
+    W --> LLM["Claude API"]
+    LLM --> PG2[("evaluations\ntable")]
+    PG2 -->|"≥ alertThreshold"| Email["Email Alert"]
+
+    style X fill:#374151,color:#9ca3af
+    style Y fill:#374151,color:#9ca3af
 ```
 
 The same deduplication hash prevents the same story from being processed twice, even if Polygon and Reuters both publish it. The normalisation layer means adding a fourth source in future is a single new file — no changes anywhere else.
@@ -1638,6 +1781,40 @@ export function requireAuth(req, res, next) {
 
 Applied as `router.use(requireAuth)` at the top of every route file. Health endpoints (`/health`, `/health/pipeline`) are intentionally left unprotected — they need to be reachable by uptime monitors without credentials.
 
+### Auth Request Flow
+
+```mermaid
+sequenceDiagram
+    participant B  as Browser
+    participant MW as Next.js Middleware
+    participant Cl as Clerk (hosted)
+    participant FE as Frontend Page
+    participant API as Express API
+    participant DB as PostgreSQL
+
+    B->>MW: GET / (no session)
+    MW->>Cl: validate session cookie
+    Cl-->>MW: no valid session
+    MW-->>B: 302 → /sign-in
+
+    B->>FE: GET /sign-in
+    FE-->>B: <SignIn /> component
+    B->>Cl: submit credentials
+    Cl-->>B: session cookie + JWT
+
+    B->>MW: GET / (with session)
+    MW->>Cl: validate session cookie
+    Cl-->>MW: userId = user_2Nxxx
+    MW-->>B: render page
+
+    B->>API: GET /theses<br/>Authorization: Bearer JWT
+    API->>Cl: verify JWT (clerkMiddleware)
+    Cl-->>API: userId = user_2Nxxx
+    API->>DB: findMany({ where: { userId } })
+    DB-->>API: [Thesis, ...]
+    API-->>B: 200 JSON
+```
+
 ---
 
 ### Ownership checks on PATCH and DELETE
@@ -1775,6 +1952,30 @@ health = round((20 + 100) / 2) = 60  →  yellow
 ```
 
 Using the last 10 evaluations (not all-time) keeps the score responsive to recent news while smoothing out single outliers.
+
+```mermaid
+flowchart LR
+    subgraph Inputs["Last 10 Evaluations"]
+        E1["SUPPORTS  80 → +80"]
+        E2["SUPPORTS  80 → +80"]
+        E3["WEAKENS   60 → -60"]
+        E4["NEUTRAL   70 →   0"]
+        E5["NEUTRAL   50 →   0"]
+    end
+
+    E1 & E2 & E3 & E4 & E5 --> Sum["sum / count\n= 100 / 5 = 20\nraw range: −100 → +100"]
+    Sum --> Map["(20 + 100) / 2 = 60\nhealth range: 0 → 100"]
+
+    Map --> Green["70–100\n🟢 Well-supported"]
+    Map --> Yellow["40–69\n🟡 Mixed signals"]
+    Map --> Red["0–39\n🔴 Under pressure"]
+
+    style Green  fill:#14532d,color:#86efac
+    style Yellow fill:#713f12,color:#fde68a
+    style Red    fill:#7f1d1d,color:#fca5a5
+    style Sum    fill:#1e3a5f,color:#93c5fd
+    style Map    fill:#1e3a5f,color:#93c5fd
+```
 
 ---
 
